@@ -1,8 +1,11 @@
 FROM python:3.11-slim
 
-# Install FFmpeg
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
+USER root
+
+# Install FFmpeg in a single layer
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user (required by HuggingFace Spaces)
@@ -12,10 +15,11 @@ ENV PATH="/home/user/.local/bin:$PATH"
 
 WORKDIR /app
 
-COPY --chown=user:user requirements.txt requirements.txt
-RUN pip install --no-cache-dir --upgrade -r requirements.txt
+COPY --chown=user:user requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
-COPY --chown=user:user . /app
+COPY --chown=user:user . .
 
 EXPOSE 7860
 
