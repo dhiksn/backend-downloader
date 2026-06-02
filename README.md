@@ -2,7 +2,7 @@
 title: RaiSaver Backend
 emoji: 🎬
 colorFrom: purple
-colorTo: cyan
+colorTo: blue
 sdk: docker
 pinned: false
 ---
