@@ -735,9 +735,8 @@ def get_instagram_info(url: str):
 
 @app.get("/proxy-image")
 def proxy_image(url: str = ""):
-    """Proxy image through backend to avoid Instagram hotlink / CORS issues."""
+    """Proxy image through backend to avoid hotlink / CORS issues."""
     try:
-        # Return transparent 1x1 PNG if no URL provided
         if not url or not url.startswith("http"):
             import base64
             from fastapi.responses import Response
@@ -746,33 +745,34 @@ def proxy_image(url: str = ""):
             )
             return Response(content=pixel, media_type="image/png")
 
+        # Pick Referer based on domain
+        if 'tiktok' in url or 'tiktokcdn' in url or 'muscdn' in url:
+            referer = 'https://www.tiktok.com/'
+        elif 'instagram' in url or 'cdninstagram' in url or 'fbcdn' in url:
+            referer = 'https://www.instagram.com/'
+        else:
+            referer = 'https://www.google.com/'
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer": "https://www.instagram.com/",
+            "Referer": referer,
             "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "sec-fetch-dest": "image",
-            "sec-fetch-mode": "no-cors",
-            "sec-fetch-site": "cross-site",
         }
 
-        resp = requests.get(url, headers=headers, timeout=20, stream=True)
+        resp = requests.get(url, headers=headers, timeout=20)
 
-        if resp.status_code == 403:
-            # Instagram CDN blocked — return a transparent 1x1 pixel as fallback
-            # so the Flutter app doesn't crash trying to load the thumbnail
+        if resp.status_code in (403, 404):
             import base64
+            from fastapi.responses import Response
             pixel = base64.b64decode(
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
             )
-            from fastapi.responses import Response
             return Response(content=pixel, media_type="image/png")
 
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=f"CDN returned {resp.status_code}")
 
-        # Read full content into memory — more reliable than streaming resp.raw
         content = resp.content
         content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
 
