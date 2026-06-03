@@ -93,105 +93,92 @@ def get_progress(task_id: str):
 @app.get("/info")
 def get_info(url: str):
     try:
-        # Try multiple strategies to get all formats
         all_formats = []
         info = None
-        
-        # Strategy 1: Android creator client WITH proxy
+
+        base_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'geo_bypass': True,
+            'geo_bypass_country': 'US',
+        }
+
+        # Strategy 1: tv_embedded — still works without PO token
         try:
-            ydl_opts_android = {
-                'quiet': True,
-                'no_warnings': True,
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['android_creator'],
-                    }
-                },
-                'geo_bypass': True,
-                'geo_bypass_country': 'US',
-                **get_ydl_proxy_opts(),
+            opts = {
+                **base_opts,
+                'extractor_args': {'youtube': {'player_client': ['tv_embedded']}},
             }
-            with yt_dlp.YoutubeDL(ydl_opts_android) as ydl:
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 formats = info.get('formats', [])
                 all_formats.extend(formats)
-                print(f"Android creator client (with proxy): {len(formats)} formats")
+                print(f"tv_embedded: {len(formats)} formats")
         except Exception as e:
-            print(f"Android creator client failed: {e}")
-        
-        # Strategy 2: If we got less than 15 formats, try WITHOUT proxy
-        if len(all_formats) < 15:
+            print(f"tv_embedded failed: {e}")
+
+        # Strategy 2: web_creator
+        if len(all_formats) < 10:
             try:
-                print("Trying android_creator WITHOUT proxy...")
-                ydl_opts_no_proxy = {
-                    'quiet': True,
-                    'no_warnings': True,
-                    'extractor_args': {
-                        'youtube': {
-                            'player_client': ['android_creator'],
-                        }
-                    },
-                    'geo_bypass': True,
-                    'geo_bypass_country': 'US',
-                    # NO PROXY
+                opts = {
+                    **base_opts,
+                    'extractor_args': {'youtube': {'player_client': ['web_creator']}},
                 }
-                with yt_dlp.YoutubeDL(ydl_opts_no_proxy) as ydl:
-                    info_no_proxy = ydl.extract_info(url, download=False)
-                    formats = info_no_proxy.get('formats', [])
-                    all_formats.extend(formats)
-                    if not info or len(formats) > len(info.get('formats', [])):
-                        info = info_no_proxy
-                    print(f"Android creator client (no proxy): {len(formats)} formats")
-            except Exception as e:
-                print(f"Android creator (no proxy) failed: {e}")
-        
-        # Strategy 3: Try android regular
-        if len(all_formats) < 15:
-            try:
-                ydl_opts_android_regular = {
-                    'quiet': True,
-                    'no_warnings': True,
-                    'extractor_args': {
-                        'youtube': {
-                            'player_client': ['android'],
-                        }
-                    },
-                    'geo_bypass': True,
-                    'geo_bypass_country': 'US',
-                    # Try without proxy
-                }
-                with yt_dlp.YoutubeDL(ydl_opts_android_regular) as ydl:
-                    info_android = ydl.extract_info(url, download=False)
-                    formats = info_android.get('formats', [])
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info2 = ydl.extract_info(url, download=False)
+                    formats = info2.get('formats', [])
                     all_formats.extend(formats)
                     if not info:
-                        info = info_android
-                    print(f"Android regular client: {len(formats)} formats")
+                        info = info2
+                    print(f"web_creator: {len(formats)} formats")
             except Exception as e:
-                print(f"Android regular client failed: {e}")
-        
-        # Strategy 4: iOS client
-        if len(all_formats) < 15:
+                print(f"web_creator failed: {e}")
+
+        # Strategy 3: mweb
+        if len(all_formats) < 10:
             try:
-                ydl_opts_ios = {
-                    'quiet': True,
-                    'no_warnings': True,
-                    'extractor_args': {
-                        'youtube': {
-                            'player_client': ['ios'],
-                        }
-                    },
+                opts = {
+                    **base_opts,
+                    'extractor_args': {'youtube': {'player_client': ['mweb']}},
                 }
-                with yt_dlp.YoutubeDL(ydl_opts_ios) as ydl:
-                    info_ios = ydl.extract_info(url, download=False)
-                    formats = info_ios.get('formats', [])
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info3 = ydl.extract_info(url, download=False)
+                    formats = info3.get('formats', [])
                     all_formats.extend(formats)
                     if not info:
-                        info = info_ios
-                    print(f"iOS client: {len(formats)} formats")
+                        info = info3
+                    print(f"mweb: {len(formats)} formats")
             except Exception as e:
-                print(f"iOS client failed: {e}")
-        
+                print(f"mweb failed: {e}")
+
+        # Strategy 4: ios
+        if len(all_formats) < 10:
+            try:
+                opts = {
+                    **base_opts,
+                    'extractor_args': {'youtube': {'player_client': ['ios']}},
+                }
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info4 = ydl.extract_info(url, download=False)
+                    formats = info4.get('formats', [])
+                    all_formats.extend(formats)
+                    if not info:
+                        info = info4
+                    print(f"ios: {len(formats)} formats")
+            except Exception as e:
+                print(f"ios failed: {e}")
+
+        # Strategy 5: default (no player_client specified)
+        if not info:
+            try:
+                with yt_dlp.YoutubeDL(base_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    formats = info.get('formats', [])
+                    all_formats.extend(formats)
+                    print(f"default: {len(formats)} formats")
+            except Exception as e:
+                print(f"default failed: {e}")
+
         print(f"Total formats from all clients: {len(all_formats)}")
         
         # Debug: print semua format yang ada
