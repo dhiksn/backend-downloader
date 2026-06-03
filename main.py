@@ -325,10 +325,27 @@ def get_tiktok_info(url: str):
         images = video_data.get('images', [])
         is_photo = len(images) > 0
         
-        # Get thumbnail
-        thumbnail = video_data.get('cover', '')
+        # Get thumbnail — try cover, origin_cover, then first image for photo posts
+        thumbnail = video_data.get('cover', '') or video_data.get('origin_cover', '')
+        if not thumbnail and is_photo and images:
+            # For photo/slideshow, use the first image as thumbnail
+            thumbnail = images[0] if isinstance(images[0], str) else images[0].get('url', '')
+        
+        # Fallback: fetch thumbnail via yt-dlp if still empty
         if not thumbnail:
-            thumbnail = video_data.get('origin_cover', '')
+            try:
+                ydl_opts_thumb = {'quiet': True, 'no_warnings': True}
+                with yt_dlp.YoutubeDL(ydl_opts_thumb) as ydl:
+                    meta = ydl.extract_info(url, download=False)
+                    if meta:
+                        thumbnail = meta.get('thumbnail', '')
+                        if not thumbnail:
+                            thumbs = meta.get('thumbnails') or []
+                            if thumbs:
+                                thumbnail = thumbs[-1].get('url', '')
+                print(f"yt-dlp thumbnail fallback: {thumbnail[:60] if thumbnail else 'none'}")
+            except Exception as e:
+                print(f"yt-dlp thumbnail fallback failed: {e}")
         
         # Get duration
         duration = video_data.get('duration', 0)
