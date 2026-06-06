@@ -364,7 +364,7 @@ def _fmt_size(n: float) -> str:
 
 def download_file(url: str, save_path: str, label: str = "Downloading") -> str:
     """
-    Stream-download with a Rich progress bar.
+    Stream-download with a Rich progress bar showing file size and speed.
     Returns the final saved path.
     """
     # Force absolute path and ensure initial directory exists
@@ -386,20 +386,27 @@ def download_file(url: str, save_path: str, label: str = "Downloading") -> str:
                 final_name = m.group(1)
         
         if final_name:
-            # Clean filename from any accidental path separators
             final_name = os.path.basename(final_name)
             save_path = os.path.join(os.path.dirname(save_path), final_name)
-            # Re-ensure directory exists for the final path
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
         total = int(resp.headers.get("content-length", 0)) or None
 
+        # Format total size for display in label
+        size_str = ""
+        if total:
+            size_mb = total / (1024 * 1024)
+            if size_mb >= 1024:
+                size_str = f"  [bright_black]({size_mb/1024:.2f} GiB)[/]"
+            else:
+                size_str = f"  [bright_black]({size_mb:.2f} MiB)[/]"
+
         with Progress(
             TextColumn("  "),
             SpinnerColumn(spinner_name="dots", style="cyan"),
-            TextColumn(f"[bold cyan]✦[/]  [white]{escape(label[:40])}[/]"),
+            TextColumn(f"[bold cyan]✦[/]  [white]{escape(label[:40])}[/]{size_str}"),
             BarColumn(
-                bar_width=30,
+                bar_width=28,
                 style="bright_black",
                 complete_style="green",
                 finished_style="green",
@@ -420,6 +427,15 @@ def download_file(url: str, save_path: str, label: str = "Downloading") -> str:
     if not os.path.isfile(save_path):
         raise Exception(f"File failed to save at {save_path}")
 
+    # Show final size after download
+    final_size = os.path.getsize(save_path)
+    size_mb = final_size / (1024 * 1024)
+    if size_mb >= 1024:
+        size_display = f"{size_mb/1024:.2f} GiB"
+    else:
+        size_display = f"{size_mb:.2f} MiB"
+    console.print(f"  [green]✓[/]  [dim]Saved[/] [white]{escape(os.path.basename(save_path))}[/]  [bright_black]{size_display}[/]")
+
     return save_path
 
 
@@ -429,7 +445,7 @@ def poll_progress(task_id: str, label: str = "Processing", stop_event: threading
     i = 0
     while True:
         if stop_event and stop_event.is_set():
-            console.print(" " * 80, end="\r")
+            console.print(" " * 90, end="\r")
             break
         try:
             r = requests.get(
@@ -437,19 +453,34 @@ def poll_progress(task_id: str, label: str = "Processing", stop_event: threading
                 params={"task_id": task_id},
                 timeout=5,
             )
-            data   = r.json()
-            status = data.get("status", "")
-            prog   = data.get("progress", 0.0)
+            data      = r.json()
+            status    = data.get("status", "")
+            prog      = data.get("progress", 0.0)
+            speed     = data.get("speed", "")      # e.g. "2.66MiB/s"
+            total_str = data.get("total", "")      # e.g. "900.99MiB"
+
             filled = int(prog * 28)
             bar    = f"[cyan]{'█' * filled}[/][bright_black]{'░' * (28 - filled)}[/]"
             pct    = f"[cyan]{prog * 100:.0f}%[/]"
+
+            # Build extra info string
+            extras = []
+            if total_str:
+                extras.append(f"[white]{total_str}[/]")
+            if speed:
+                extras.append(f"[cyan]{speed}[/]")
+            extra_str = "  " + "  ".join(extras) if extras else ""
+
+            # Only show label if no extra info, to avoid duplication
+            label_str = f"  [dim]{label}[/]" if not extras else ""
+
             console.print(
-                f"  [cyan]{spinner[i % len(spinner)]}[/]  {bar}  {pct}  [dim]{label}[/]",
+                f"  [cyan]{spinner[i % len(spinner)]}[/]  {bar}  {pct}{extra_str}{label_str}",
                 end="\r",
             )
             i += 1
             if status in ("completed", "error"):
-                console.print(" " * 80, end="\r")
+                console.print(" " * 90, end="\r")
                 break
         except Exception:
             pass

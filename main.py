@@ -38,6 +38,8 @@ def cleanup_files(base_name: str):
             pass
 
 download_progress = {}
+# Guard: task_id yang sedang aktif di-download, cegah request duplikat
+_active_tasks: set = set()
 
 # Platform detection helper
 def detect_platform(url: str) -> str:
@@ -368,18 +370,19 @@ def get_tiktok_info(url: str):
                     "download_url": img_url
                 })
         else:
-            # For video
+            # Untuk video: play dan hdplay sudah termasuk audio asli
+            # Prioritaskan hdplay terlebih dahulu jika tersedia
             if hdplay_url:
                 video_formats.append({
-                    "resolution": "HD",
+                    "resolution": "HD Quality",
                     "format_id": "hd",
                     "ext": "mp4",
                     "download_url": hdplay_url
                 })
             
-            if play_url:
+            if play_url and play_url != hdplay_url:
                 video_formats.append({
-                    "resolution": "SD",
+                    "resolution": "Standard Quality",
                     "format_id": "sd",
                     "ext": "mp4",
                     "download_url": play_url
@@ -424,6 +427,83 @@ def get_tiktok_info(url: str):
 
 SANKAVOLLEREI_API_KEY = "planaai"
 SANKAVOLLEREI_API_URL = "https://www.sankavollerei.com/download/instagram"
+
+BINTANGAPI_URL = "https://bintangapi.full.diskon.cloud/api/downloader/instagram/"
+
+def _fetch_instagram_via_bintangapi(url: str) -> dict:
+    """
+    Fetch Instagram Reels/video info via BintangAPI.
+    Returns dict compatible with our standard format.
+    Raises Exception on failure.
+    """
+    clean_url = url.split('?')[0] if '?' in url else url
+    print(f"Fetching Instagram via BintangAPI: {clean_url}")
+
+    resp = requests.get(
+        BINTANGAPI_URL,
+        params={"url": clean_url},
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise Exception(f"BintangAPI HTTP {resp.status_code}")
+
+    data = resp.json()
+    if not data.get("status"):
+        raise Exception(f"BintangAPI error: {data.get('error', 'unknown')}")
+
+    result = data.get("result", {})
+
+    title     = result.get("title") or "-"
+    username  = result.get("username") or "-"
+    thumbnail = result.get("thumbnail") or ""
+
+    # Normalise thumbnail: bisa string atau list
+    if isinstance(thumbnail, list) and thumbnail:
+        thumbnail = thumbnail[0]
+    if not isinstance(thumbnail, str):
+        thumbnail = ""
+
+    # media[] berisi object atau string URL
+    media_list = result.get("media") or []
+    video_formats = []
+    for idx, item in enumerate(media_list):
+        if isinstance(item, str):
+            media_url = item
+            ext = "mp4"
+            label = f"Video {idx + 1}" if idx > 0 else "HD"
+        elif isinstance(item, dict):
+            media_url = item.get("url") or item.get("download_url") or ""
+            ext = item.get("type", "video/mp4").split("/")[-1] if "/" in item.get("type", "") else "mp4"
+            ext = ext if ext in ("mp4", "jpg", "jpeg", "png") else "mp4"
+            label = item.get("quality") or item.get("resolution") or (f"Video {idx + 1}" if idx > 0 else "HD")
+        else:
+            continue
+
+        if not media_url:
+            continue
+
+        video_formats.append({
+            "resolution": label,
+            "format_id": f"bintang_{idx}",
+            "ext": ext,
+            "download_url": media_url,
+        })
+
+    if not video_formats:
+        raise Exception("BintangAPI: tidak ada media yang bisa diunduh")
+
+    return {
+        "title": title[:200],
+        "description": "",
+        "thumbnail": thumbnail,
+        "channel": username,
+        "duration": None,
+        "video_formats": video_formats,
+        "platform": "instagram",
+        "is_photo": False,
+        "is_carousel": len(video_formats) > 1,
+    }
 
 def _make_filename_slug(text: str, max_len: int = 50) -> str:
     """
@@ -603,134 +683,21 @@ def get_instagram_info(url: str):
     except HTTPException:
         raise
     except Exception as api_err:
-        print(f"sankavollerei API failed: {api_err}, falling back to yt-dlp")
+        print(f"sankavollerei API failed: {api_err}, falling back to BintangAPI")
 
-    # --- Fallback: yt-dlp (Reels / video only) ---
+    # --- Fallback: BintangAPI (Reels / video) ---
     try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': False,
-        }
-
-        instagram_cookies = os.environ.get('INSTAGRAM_COOKIES', '')
-        if instagram_cookies:
-            cookies_from_browser = os.environ.get('INSTAGRAM_COOKIES_FROM_BROWSER', '')
-            if cookies_from_browser:
-                ydl_opts['cookiesfrombrowser'] = (cookies_from_browser,)
-            else:
-                import tempfile
-                cookie_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
-                cookie_file.write(instagram_cookies)
-                cookie_file.close()
-                ydl_opts['cookiefile'] = cookie_file.name
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        if not info:
-            raise Exception("Failed to extract Instagram info")
-
-        # Detect photo/carousel (yt-dlp returns playlist with 0 entries for photos)
-        if info.get('_type') == 'playlist':
-            entries = list(info.get('entries') or [])
-            if len(entries) == 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Post ini adalah foto/carousel dan API tidak tersedia saat ini. Coba lagi nanti.",
-                )
-            info = None
-            for entry in entries:
-                if isinstance(entry, dict):
-                    if entry.get('url') and not entry.get('formats'):
-                        try:
-                            with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
-                                entry = ydl2.extract_info(entry['url'], download=False) or entry
-                        except Exception:
-                            pass
-                    if entry.get('formats') or entry.get('vcodec') not in (None, 'none'):
-                        info = entry
-                        break
-            if not info:
-                raise HTTPException(status_code=400, detail="Tidak ada video yang bisa di-download dari post ini.")
-        else:
-            entries = info.get('entries')
-            if entries:
-                first = entries[0]
-                if isinstance(first, dict) and first.get('url'):
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
-                        info = ydl2.extract_info(first['url'], download=False) or first
-                elif isinstance(first, dict):
-                    info = first
-
-        title    = info.get('title') or info.get('description') or 'Instagram'
-        uploader = info.get('uploader') or info.get('uploader_id') or 'Instagram'
-        thumbnail = info.get('thumbnail') or ''
-        if not thumbnail:
-            thumbs = info.get('thumbnails') or []
-            if thumbs:
-                best = max(thumbs, key=lambda t: (t.get('width') or 0) * (t.get('height') or 0), default=None)
-                thumbnail = (best or {}).get('url') or thumbs[-1].get('url') or ''
-        duration = info.get('duration')
-
-        formats = info.get('formats', [])
-        video_formats = []
-        if formats:
-            height_set = set()
-            for f in formats:
-                h = f.get('height')
-                if h and h not in height_set and f.get('vcodec') != 'none':
-                    height_set.add(h)
-                    video_formats.append({
-                        'resolution': f'{h}p',
-                        'format_id': f.get('format_id', 'best'),
-                        'ext': f.get('ext', 'mp4'),
-                    })
-            video_formats.sort(key=lambda x: int(x['resolution'].replace('p', '') or 0), reverse=True)
-
-        if video_formats:
-            # Simplify to HD and SD for Instagram
-            simplified = []
-            # Best quality is HD
-            best = video_formats[0]
-            best['resolution'] = "HD (High Quality)"
-            simplified.append(best)
-            
-            # If there's a significantly lower quality, call it SD
-            if len(video_formats) > 1:
-                worst = video_formats[-1]
-                if worst['format_id'] != best['format_id']:
-                    worst['resolution'] = "SD (Standard Quality)"
-                    simplified.append(worst)
-            
-            video_formats = simplified
-
-        if not video_formats:
-            raise HTTPException(
-                status_code=400,
-                detail="Post ini adalah foto/carousel. Hanya Reels dan video posts yang bisa di-download.",
-            )
-
-        return {
-            'title': title[:200] if title else 'Instagram',
-            'thumbnail': thumbnail,
-            'channel': uploader,
-            'duration': duration,
-            'video_formats': video_formats,
-            'platform': 'instagram',
-            'is_photo': False,
-            'is_carousel': False
-        }
+        result = _fetch_instagram_via_bintangapi(url)
+        print(f"Instagram info via BintangAPI: {len(result['video_formats'])} media items")
+        return result
     except HTTPException:
         raise
-    except ExtractorError as e:
-        msg = str(e)
-        if 'There is no video in this post' in msg:
-            raise HTTPException(status_code=400, detail="Post ini adalah foto. Hanya Reels dan video yang bisa di-download.")
-        raise HTTPException(status_code=400, detail=f"Instagram extractor: {msg}")
-    except Exception as e:
-        import traceback
-        print(f"Instagram yt-dlp fallback error: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=400, detail=f"Instagram: {str(e)}")
+    except Exception as bintang_err:
+        print(f"BintangAPI failed: {bintang_err}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Gagal mengambil info Instagram. Pastikan link valid dan post bersifat publik. ({bintang_err})"
+        )
 
 
 @app.get("/proxy-image")
@@ -882,80 +849,95 @@ def download_instagram(url: str, background_tasks: BackgroundTasks, format_id: O
             download_progress.pop(task_id, None)
             raise HTTPException(status_code=400, detail=f"Instagram API download: {str(e)}")
 
-    # --- yt-dlp download (Reels / video, format_id is a yt-dlp format id) ---
-    def my_hook(d):
-        if d['status'] == 'downloading':
-            total = d.get('total_bytes') or d.get('total_bytes_estimate', 1)
-            downloaded = d.get('downloaded_bytes', 0)
-            if total > 0:
-                download_progress[task_id] = {"status": "downloading", "progress": downloaded / total}
-        elif d['status'] == 'finished':
-            download_progress[task_id] = {"status": "processing", "progress": 1.0}
-
-    ydl_opts = {
-        'format': format_id if format_id and format_id != 'best' else 'best[ext=mp4]/best',
-        'outtmpl': f"{base_name}.%(ext)s",
-        'quiet': True,
-        'progress_hooks': [my_hook],
-        'nocheckcertificate': True,
-    }
-
-    instagram_cookies = os.environ.get('INSTAGRAM_COOKIES', '')
-    if instagram_cookies:
-        cookies_from_browser = os.environ.get('INSTAGRAM_COOKIES_FROM_BROWSER', '')
-        if cookies_from_browser:
-            ydl_opts['cookiesfrombrowser'] = (cookies_from_browser,)
-        else:
-            import tempfile
-            cookie_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
-            cookie_file.write(instagram_cookies)
-            cookie_file.close()
-            ydl_opts['cookiefile'] = cookie_file.name
-
+    # --- BintangAPI download (format_id starts with "bintang_") or fallback ---
+    # Re-fetch info from BintangAPI to get download_url
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        files = glob.glob(f"{base_name}*")
-        files = [f for f in files if not f.endswith('.part') and os.path.isfile(f)]
-        if not files:
-            raise Exception("File not found after download")
-        file_path = files[0]
-        ext = file_path.split('.')[-1]
-        info = None
-        try:
-            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-                info = ydl.extract_info(url, download=False)
-            if info and info.get('entries'):
-                info = info['entries'][0] if isinstance(info['entries'][0], dict) else info
-        except Exception:
-            pass
-        safe_title = 'instagram'
-        if info:
-            safe_title = re.sub(r'[\\/:*?"<>|]', '_', (info.get('title') or info.get('uploader') or 'instagram')).strip() or 'instagram'
-        if not safe_title or safe_title == 'instagram':
-            safe_title = f"instagram_{task_id}"
+        info_resp = _fetch_instagram_via_bintangapi(url)
+        formats = info_resp.get("video_formats") or []
+
+        # Cari format yang diminta
+        target_fmt = None
+        if format_id and format_id.startswith("bintang_"):
+            for f in formats:
+                if f.get("format_id") == format_id:
+                    target_fmt = f
+                    break
+
+        # Fallback ke format pertama (HD)
+        if not target_fmt and formats:
+            target_fmt = formats[0]
+
+        if not target_fmt or not target_fmt.get("download_url"):
+            raise HTTPException(status_code=400, detail="URL media tidak ditemukan.")
+
+        download_url = target_fmt["download_url"]
+        file_ext     = target_fmt.get("ext", "mp4")
+        raw_title    = info_resp.get("title") or info_resp.get("channel") or "instagram"
+
+        download_progress[task_id] = {"status": "downloading", "progress": 0.1}
+
+        r = requests.get(
+            download_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://www.instagram.com/",
+            },
+            stream=True,
+            timeout=(30, 600),
+        )
+        if r.status_code != 200:
+            raise Exception(f"Gagal download media: HTTP {r.status_code}")
+
+        file_path  = f"{base_name}.{file_ext}"
+        total_size = int(r.headers.get("content-length", 0))
+        downloaded = 0
+        with open(file_path, "wb") as fh:
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        download_progress[task_id] = {
+                            "status": "downloading",
+                            "progress": downloaded / total_size,
+                            "speed": "",
+                            "total": f"{total_size / 1048576:.1f}MB",
+                        }
+
+        download_progress[task_id] = {"status": "completed", "progress": 1.0}
+
+        safe_title = re.sub(r'[\\/:*?"<>|]', '_', raw_title).strip() or f"instagram_{task_id}"
+
+        if file_ext in ("jpg", "jpeg"):
+            media_type = "image/jpeg"
+        elif file_ext == "png":
+            media_type = "image/png"
+        else:
+            media_type = "video/mp4"
+
+        from urllib.parse import quote
+        ascii_name = safe_title.encode('ascii', errors='replace').decode('ascii').replace('?', '_')
+        utf8_name  = quote(f"{safe_title}.{file_ext}", safe='')
+        content_disposition = (
+            f'attachment; filename="{ascii_name}.{file_ext}"; '
+            f"filename*=UTF-8''{utf8_name}"
+        )
 
         def cleanup_all():
             cleanup_files(base_name)
             download_progress.pop(task_id, None)
         background_tasks.add_task(cleanup_all)
 
-        from urllib.parse import quote
-        ascii_name = safe_title.encode('ascii', errors='replace').decode('ascii').replace('?', '_')
-        utf8_name  = quote(f"{safe_title}.{ext}", safe='')
-        content_disposition = (
-            f'attachment; filename="{ascii_name}.{ext}"; '
-            f"filename*=UTF-8''{utf8_name}"
+        return FileResponse(
+            file_path,
+            media_type=media_type,
+            headers={"Content-Disposition": content_disposition},
         )
-        media_type = "video/mp4" if ext in ('mp4', 'webm') else "image/jpeg" if ext in ('jpg', 'jpeg') else "image/png"
-        return FileResponse(file_path, media_type=media_type, headers={"Content-Disposition": content_disposition})
-    except ExtractorError as e:
+
+    except HTTPException:
         cleanup_files(base_name)
         download_progress.pop(task_id, None)
-        msg = str(e)
-        if 'There is no video in this post' in msg:
-            raise HTTPException(status_code=400, detail="Post ini hanya foto. Gunakan tombol Download Photo di layar info.")
-        raise HTTPException(status_code=400, detail=f"Instagram extractor: {msg}")
+        raise
     except Exception as e:
         cleanup_files(base_name)
         download_progress.pop(task_id, None)
@@ -1052,131 +1034,195 @@ def download_instagram_all(url: str, background_tasks: BackgroundTasks, task_id:
 
 @app.get("/tiktok/download")
 def download_tiktok(url: str, background_tasks: BackgroundTasks, format_id: Optional[str] = "hd", task_id: Optional[str] = None):
-    """Download TikTok video or photo using TikWM API"""
+    """Download TikTok video or photo using TikWM API, merge audio if needed."""
+    # Jika format_id=mp3, redirect ke endpoint download_tiktok_mp3
+    if format_id == "mp3":
+        return download_tiktok_mp3(url, background_tasks, task_id)
+    
     if not task_id:
         task_id = str(uuid.uuid4())
     base_name = f"temp_{task_id}"
 
-    download_progress[task_id] = {"status": "starting", "progress": 0.0}
-    
-    try:
-        # Clean the URL
-        if '?' in url:
-            clean_url = url.split('?')[0]
-        else:
-            clean_url = url
-        
-        print(f"Downloading TikTok via TikWM: {clean_url}")
-        
-        # Get video/photo info first
-        info_response = get_tiktok_info(clean_url)
-        
-        if not info_response.get('video_formats'):
-            raise Exception("Tidak ada format yang tersedia")
-        
-        is_photo = info_response.get('is_photo', False)
-        
-        # Find the requested format
-        download_url = None
-        file_ext = "mp4"
-        format_resolution = ""
-        
-        for fmt in info_response['video_formats']:
-            if fmt['format_id'] == format_id:
-                download_url = fmt['download_url']
-                file_ext = fmt.get('ext', 'mp4')
-                format_resolution = fmt.get('resolution', '')
-                break
-        
-        # If format not found, use first available
-        if not download_url:
-            download_url = info_response['video_formats'][0]['download_url']
-            file_ext = info_response['video_formats'][0].get('ext', 'mp4')
-            format_resolution = info_response['video_formats'][0].get('resolution', '')
-        
-        if not download_url:
-            raise Exception("Tidak bisa mendapatkan URL download")
-        
-        print(f"Download URL: {download_url[:50]}..., ext: {file_ext}")
-        
-        # Download file
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://www.tikwm.com/',
-        }
-        
-        download_progress[task_id] = {"status": "downloading", "progress": 0.1}
-        
-        response = requests.get(download_url, headers=headers, stream=True, timeout=30)
-        
-        if response.status_code != 200:
-            raise Exception(f"Gagal download: status code {response.status_code}")
-        
-        # Save file
-        file_path = f"{base_name}.{file_ext}"
-        total_size = int(response.headers.get('content-length', 0))
-        downloaded = 0
-        
-        print(f"Downloading file, size: {total_size} bytes")
-        
-        with open(file_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0:
-                        progress = downloaded / total_size
-                        download_progress[task_id] = {"status": "downloading", "progress": progress}
-        
-        download_progress[task_id] = {"status": "completed", "progress": 1.0}
-        
-        print(f"Download completed: {downloaded} bytes")
-        
-        # Generate simple filename: tiktok_{timestamp}_{type}.ext
+    # ── Dedup: kalau task_id ini sudah selesai, langsung return file yang ada ──
+    if task_id in download_progress:
+        existing = download_progress[task_id]
+        # Kalau sudah completed dan file masih ada, serve ulang
+        if existing.get("status") == "completed":
+            final_path = existing.get("final_path", "")
+            if final_path and os.path.isfile(final_path):
+                from urllib.parse import quote
+                fname = os.path.basename(final_path)
+                ascii_name = fname.encode('ascii', errors='replace').decode('ascii').replace('?', '_')
+                utf8_name  = quote(fname, safe='')
+                return FileResponse(
+                    final_path,
+                    media_type="video/mp4",
+                    headers={"Content-Disposition": f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{utf8_name}'},
+                )
+
+    # ── Cegah request duplikat yang sedang berjalan ───────────────────────────
+    if task_id in _active_tasks:
+        # Return progress saja, download sedang berjalan di request lain
         import time
-        timestamp = str(int(time.time()))
-        
+        # Poll sampai selesai (max 15 menit)
+        for _ in range(900):
+            prog = download_progress.get(task_id, {})
+            if prog.get("status") == "completed":
+                final_path = prog.get("final_path", "")
+                if final_path and os.path.isfile(final_path):
+                    from urllib.parse import quote
+                    fname = os.path.basename(final_path)
+                    ascii_name = fname.encode('ascii', errors='replace').decode('ascii').replace('?', '_')
+                    utf8_name  = quote(fname, safe='')
+                    return FileResponse(
+                        final_path,
+                        media_type="video/mp4",
+                        headers={"Content-Disposition": f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{utf8_name}'},
+                    )
+            if prog.get("status") == "error":
+                raise HTTPException(status_code=400, detail=prog.get("error", "Download gagal"))
+            time.sleep(1)
+        raise HTTPException(status_code=408, detail="Timeout menunggu download selesai")
+
+    _active_tasks.add(task_id)
+    download_progress[task_id] = {"status": "starting", "progress": 0.0}
+
+    def _dl(dl_url: str, dest: str, prog_start: float = 0.1, prog_end: float = 0.9):
+        """Download URL ke file, update progress."""
+        hdrs = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Referer': 'https://www.tiktok.com/',
+            'Accept': '*/*',
+            'Accept-Encoding': 'identity',
+        }
+        r = requests.get(dl_url, headers=hdrs, stream=True, timeout=60, allow_redirects=True)
+        if r.status_code not in (200, 206):
+            raise Exception(f"HTTP {r.status_code} saat download")
+        total = int(r.headers.get('content-length', 0))
+        got = 0
+        with open(dest, 'wb') as fh:
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:
+                    fh.write(chunk)
+                    got += len(chunk)
+                    if total > 0:
+                        pct = prog_start + (got / total) * (prog_end - prog_start)
+                        download_progress[task_id] = {
+                            "status": "downloading",
+                            "progress": pct,
+                            "total": f"{total / 1048576:.1f}MB",
+                        }
+        if got < 10240:
+            raise Exception(f"File terlalu kecil ({got} bytes), URL mungkin expired.")
+        return got
+
+    try:
+        clean_url = url.split('?')[0] if '?' in url else url
+        print(f"Downloading TikTok: {clean_url}")
+
+        # ── Panggil TikWM langsung untuk dapat music_url juga ─────────────
+        api_resp = requests.post(
+            "https://www.tikwm.com/api/",
+            data={"url": clean_url, "hd": 1},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        raw = api_resp.json()
+        if raw.get('code') != 0:
+            raise Exception(f"TikWM: {raw.get('msg', 'unknown error')}")
+
+        vdata       = raw['data']
+        is_photo    = bool(vdata.get('images'))
+        play_url    = vdata.get('play', '')
+        hdplay_url  = vdata.get('hdplay', '')
+        music_url   = vdata.get('music', '')   # audio terpisah
+        hd_size     = vdata.get('hd_size', 0)
+        sd_size     = vdata.get('size', 0)
+        title       = vdata.get('title', 'tiktok')
+
+        # ── Foto / slideshow ──────────────────────────────────────────────
         if is_photo:
-            # For photo: tiktok_{timestamp}_img1.jpg
-            img_num = format_resolution.replace('Image ', '').strip() if 'Image' in format_resolution else '1'
-            safe_title = f"tiktok_{timestamp}_img{img_num}"
+            images = vdata.get('images', [])
+            # format_id: "img_0", "img_1", ...
+            idx = 0
+            try:
+                idx = int(format_id.replace('img_', ''))
+            except Exception:
+                pass
+            img_url = images[idx] if idx < len(images) else images[0]
+            img_path = f"{base_name}_img{idx}.jpg"
+            _dl(img_url, img_path)
+            download_progress[task_id] = {"status": "completed", "progress": 1.0}
+
+            import time
+            safe = f"tiktok_{int(time.time())}_img{idx + 1}"
+
+            def cleanup_all():
+                cleanup_files(base_name)
+                download_progress.pop(task_id, None)
+            background_tasks.add_task(cleanup_all)
+
+            from urllib.parse import quote
+            utf8 = quote(f"{safe}.jpg", safe='')
+            return FileResponse(
+                img_path, media_type="image/jpeg",
+                headers={"Content-Disposition": f'attachment; filename="{safe}.jpg"; filename*=UTF-8\'\'{utf8}'},
+            )
+
+        # ── Video ─────────────────────────────────────────────────────────
+        # Pilih video URL
+        if format_id == 'sd' and play_url:
+            video_url = play_url
         else:
-            # For video: tiktok_{timestamp}.mp4
-            safe_title = f"tiktok_{timestamp}"
+            video_url = hdplay_url or play_url
+
+        if not video_url:
+            raise Exception("Tidak ada URL video tersedia")
+
+        video_path = f"{base_name}_video.mp4"
+        download_progress[task_id] = {"status": "downloading", "progress": 0.05}
+
+        # Download video asli (sudah termasuk audio asli)
+        _dl(video_url, video_path, prog_start=0.05, prog_end=1.0)
+
+        # Pakai video langsung tanpa merge apapun
+        final_path = video_path
+
+        download_progress[task_id] = {"status": "completed", "progress": 1.0}
+
+        import time
+        safe_title = re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:60] or f"tiktok_{int(time.time())}"
 
         def cleanup_all():
             cleanup_files(base_name)
             download_progress.pop(task_id, None)
-
+            _active_tasks.discard(task_id)
         background_tasks.add_task(cleanup_all)
-        
-        # Set appropriate media type
-        if file_ext == "jpg" or file_ext == "jpeg":
-            media_type = "image/jpeg"
-        elif file_ext == "png":
-            media_type = "image/png"
-        else:
-            media_type = "video/mp4"
-        
-        final_filename = f"{safe_title}.{file_ext}"
-        print(f"Final filename: {final_filename}")
-        
-        return FileResponse(file_path, filename=final_filename, media_type=media_type)
-        
+
+        from urllib.parse import quote
+        ascii_name = safe_title.encode('ascii', errors='replace').decode('ascii').replace('?', '_')
+        utf8_name  = quote(f"{safe_title}.mp4", safe='')
+
+        # Simpan final_path supaya request duplikat bisa serve ulang
+        download_progress[task_id]["final_path"] = final_path
+
+        return FileResponse(
+            final_path,
+            media_type="video/mp4",
+            headers={"Content-Disposition": f'attachment; filename="{ascii_name}.mp4"; filename*=UTF-8\'\'{utf8_name}'},
+        )
+
     except HTTPException:
         cleanup_files(base_name)
         download_progress.pop(task_id, None)
+        _active_tasks.discard(task_id)
         raise
     except Exception as e:
         cleanup_files(base_name)
         download_progress.pop(task_id, None)
-        error_msg = str(e)
-        print(f"Error download TikTok: {error_msg}")
-        
-        raise HTTPException(
-            status_code=400,
-            detail=f"Gagal download TikTok: {error_msg}"
-        )
+        _active_tasks.discard(task_id)
+        print(f"Error download TikTok: {e}")
+        raise HTTPException(status_code=400, detail=f"Gagal download TikTok: {e}")
 
 
 @app.get("/tiktok/download/all")
@@ -1264,6 +1310,145 @@ def download_tiktok_all(url: str, background_tasks: BackgroundTasks, task_id: Op
         print(f"TikTok download all error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=400, detail=f"Download semua TikTok gagal: {str(e)}")
 
+@app.get("/tiktok/download/mp3")
+def download_tiktok_mp3(url: str, background_tasks: BackgroundTasks, task_id: Optional[str] = None):
+    """Download TikTok sebagai MP3 audio."""
+    if not task_id:
+        task_id = str(uuid.uuid4())
+    base_name = f"temp_mp3_{task_id}"
+    download_progress[task_id] = {"status": "starting", "progress": 0.0}
+    
+    def _dl(dl_url: str, dest: str, prog_start: float = 0.1, prog_end: float = 0.7):
+        """Download URL ke file, update progress."""
+        hdrs = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Referer': 'https://www.tiktok.com/',
+            'Accept': '*/*',
+            'Accept-Encoding': 'identity',
+        }
+        r = requests.get(dl_url, headers=hdrs, stream=True, timeout=60, allow_redirects=True)
+        if r.status_code not in (200, 206):
+            raise Exception(f"HTTP {r.status_code} saat download")
+        total = int(r.headers.get('content-length', 0))
+        got = 0
+        with open(dest, 'wb') as fh:
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:
+                    fh.write(chunk)
+                    got += len(chunk)
+                    if total > 0:
+                        pct = prog_start + (got / total) * (prog_end - prog_start)
+                        download_progress[task_id] = {
+                            "status": "downloading",
+                            "progress": pct,
+                            "total": f"{total / 1048576:.1f}MB",
+                        }
+        if got < 1024:
+            raise Exception(f"File terlalu kecil ({got} bytes), URL mungkin expired.")
+        return got
+
+    try:
+        clean_url = url.split('?')[0] if '?' in url else url
+        print(f"Downloading TikTok MP3: {clean_url}")
+
+        # Panggil TikWM API
+        api_resp = requests.post(
+            "https://www.tikwm.com/api/",
+            data={"url": clean_url, "hd": 1},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        raw = api_resp.json()
+        if raw.get('code') != 0:
+            raise Exception(f"TikWM: {raw.get('msg', 'unknown error')}")
+
+        vdata = raw['data']
+        title = vdata.get('title', 'tiktok')
+        
+        # Prioritaskan: download video lalu extract audio (untuk audio asli)
+        # Fallback: gunakan music_url jika tersedia
+        play_url = vdata.get('play', '')
+        hdplay_url = vdata.get('hdplay', '')
+        music_url = vdata.get('music', '')
+        
+        video_url = hdplay_url or play_url
+        
+        if not video_url and not music_url:
+            raise Exception("Tidak ada media yang bisa di-download")
+
+        # Download video (atau audio)
+        if video_url:
+            video_path = f"{base_name}_video.mp4"
+            download_progress[task_id] = {"status": "downloading", "progress": 0.05}
+            _dl(video_url, video_path, prog_start=0.05, prog_end=0.65)
+            
+            # Extract audio menjadi MP3
+            mp3_path = f"{base_name}.mp3"
+            download_progress[task_id] = {"status": "processing", "progress": 0.70}
+            
+            ffmpeg_cmd = [
+                'ffmpeg', '-y',
+                '-i', video_path,
+                '-vn',  # tanpa video
+                '-acodec', 'libmp3lame',
+                '-ab', '320k',  # bitrate tinggi
+                '-ar', '44100',
+                mp3_path
+            ]
+            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0 or not os.path.isfile(mp3_path) or os.path.getsize(mp3_path) < 1024:
+                raise Exception(f"Gagal extract audio: {result.stderr}")
+        else:
+            # Fallback: download music_url langsung
+            audio_path = f"{base_name}_audio"
+            download_progress[task_id] = {"status": "downloading", "progress": 0.05}
+            _dl(music_url, audio_path, prog_start=0.05, prog_end=0.90)
+            
+            # Convert ke MP3 jika bukan MP3
+            mp3_path = f"{base_name}.mp3"
+            download_progress[task_id] = {"status": "processing", "progress": 0.92}
+            
+            ffmpeg_cmd = [
+                'ffmpeg', '-y',
+                '-i', audio_path,
+                '-acodec', 'libmp3lame',
+                '-ab', '320k',
+                mp3_path
+            ]
+            subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=120)
+            if not os.path.isfile(mp3_path) or os.path.getsize(mp3_path) < 1024:
+                mp3_path = audio_path
+
+        download_progress[task_id] = {"status": "completed", "progress": 1.0}
+
+        import time
+        safe_title = re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:60] or f"tiktok_{int(time.time())}"
+
+        def cleanup_all():
+            cleanup_files(base_name)
+            download_progress.pop(task_id, None)
+        background_tasks.add_task(cleanup_all)
+
+        from urllib.parse import quote
+        ascii_name = safe_title.encode('ascii', errors='replace').decode('ascii').replace('?', '_')
+        utf8_name  = quote(f"{safe_title}.mp3", safe='')
+
+        return FileResponse(
+            mp3_path,
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": f'attachment; filename="{ascii_name}.mp3"; filename*=UTF-8\'\'{utf8_name}'},
+        )
+
+    except HTTPException:
+        cleanup_files(base_name)
+        download_progress.pop(task_id, None)
+        raise
+    except Exception as e:
+        cleanup_files(base_name)
+        download_progress.pop(task_id, None)
+        print(f"Error download TikTok MP3: {e}")
+        raise HTTPException(status_code=400, detail=f"Gagal download TikTok MP3: {e}")
+
 @app.get("/download/video")
 def download_video(url: str, format_id: str, background_tasks: BackgroundTasks, task_id: Optional[str] = None):
     if not task_id:
@@ -1276,8 +1461,25 @@ def download_video(url: str, format_id: str, background_tasks: BackgroundTasks, 
         if d['status'] == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate', 1)
             downloaded = d.get('downloaded_bytes', 0)
-            if total > 0:
-                download_progress[task_id] = {"status": "downloading", "progress": downloaded / total}
+            speed_bps = d.get('speed') or 0
+            progress = downloaded / total if total > 0 else 0
+
+            # Format total size
+            total_mb = total / (1024 * 1024)
+            total_str = f"{total_mb:.2f}MiB" if total_mb < 1024 else f"{total_mb/1024:.2f}GiB"
+
+            # Format speed
+            speed_str = ""
+            if speed_bps:
+                speed_mb = speed_bps / (1024 * 1024)
+                speed_str = f"{speed_mb:.2f}MiB/s" if speed_mb < 1024 else f"{speed_mb/1024:.2f}GiB/s"
+
+            download_progress[task_id] = {
+                "status": "downloading",
+                "progress": progress,
+                "total": total_str,
+                "speed": speed_str,
+            }
         elif d['status'] == 'finished':
             download_progress[task_id] = {"status": "processing", "progress": 1.0}
     
@@ -1354,8 +1556,25 @@ def download_audio(url: str, background_tasks: BackgroundTasks, task_id: Optiona
         if d['status'] == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate', 1)
             downloaded = d.get('downloaded_bytes', 0)
-            if total > 0:
-                download_progress[task_id] = {"status": "downloading", "progress": downloaded / total}
+            speed_bps = d.get('speed') or 0
+            progress = downloaded / total if total > 0 else 0
+
+            # Format total size
+            total_mb = total / (1024 * 1024)
+            total_str = f"{total_mb:.2f}MiB" if total_mb < 1024 else f"{total_mb/1024:.2f}GiB"
+
+            # Format speed
+            speed_str = ""
+            if speed_bps:
+                speed_mb = speed_bps / (1024 * 1024)
+                speed_str = f"{speed_mb:.2f}MiB/s" if speed_mb < 1024 else f"{speed_mb/1024:.2f}GiB/s"
+
+            download_progress[task_id] = {
+                "status": "downloading",
+                "progress": progress,
+                "total": total_str,
+                "speed": speed_str,
+            }
         elif d['status'] == 'finished':
             download_progress[task_id] = {"status": "processing", "progress": 1.0}
 
