@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
+from typing import Optional, List, Dict, Any
 import yt_dlp
 import uuid
 import re
@@ -13,6 +13,7 @@ import requests
 import json
 from proxy_config import get_ydl_proxy_opts
 from yt_dlp.utils import ExtractorError
+from bs4 import BeautifulSoup
 
 # Load environment variables from .env file (explicit path)
 backend_dir = os.path.dirname(os.path.abspath(__file__))
@@ -422,87 +423,218 @@ def get_tiktok_info(url: str):
 
 
 # --- Instagram ---
-# Uses sankavollerei API for all post types (photo, carousel, video, reels)
-# Falls back to yt-dlp for Reels/video if API fails
+# Uses SnapSave for all post types (photo, carousel, video, reels)
 
-SANKAVOLLEREI_API_KEY = "planaai"
-SANKAVOLLEREI_API_URL = "https://www.sankavollerei.com/download/instagram"
+SNAPSAVE_API_URL = "https://snapsave.app/action.php?lang=en"
 
-BINTANGAPI_URL = "https://bintangapi.full.diskon.cloud/api/downloader/instagram/"
+def _decrypt_snapsave(html: str) -> str:
+    """Use Node.js script to decrypt SnapSave response"""
+    import subprocess
+    import sys
+    import os
+    # Get the directory of main.py
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Try to find node in PATH
+    try:
+        result = subprocess.run(
+            ["node", "decrypt_snapsave.js"],
+            input=html,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=script_dir
+        )
+        if result.returncode != 0:
+            print("Node.js decrypt error:", result.stderr)
+            raise Exception("Node.js decrypt failed")
+        return result.stdout
+    except Exception as e:
+        print(f"Error decrypting with Node.js: {e}")
+        raise e
 
-def _fetch_instagram_via_bintangapi(url: str) -> dict:
-    """
-    Fetch Instagram Reels/video info via BintangAPI.
-    Returns dict compatible with our standard format.
-    Raises Exception on failure.
-    """
+def _fetch_snapsave(url: str) -> List[Dict[str, Any]]:
+    """Fetch media from SnapSave for Instagram"""
     clean_url = url.split('?')[0] if '?' in url else url
-    print(f"Fetching Instagram via BintangAPI: {clean_url}")
+    print(f"Fetching Instagram via SnapSave: {clean_url}")
+    
+    form_data = {"url": clean_url}
+    headers = {
+        "accept": "*/*",
+        "content-type": "application/x-www-form-urlencoded",
+        "origin": "https://snapsave.app",
+        "referer": "https://snapsave.app/",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0"
+    }
+    
+    response = requests.post(SNAPSAVE_API_URL, data=form_data, headers=headers, timeout=30)
+    if response.status_code != 200:
+        raise Exception(f"SnapSave HTTP {response.status_code}")
+    
+    decoded_html = _decrypt_snapsave(response.text)
+    soup = BeautifulSoup(decoded_html, 'html.parser')
+    
+    media_list = []
+    
+    # Try table layout (for videos with multiple qualities)
+    table = soup.find('table', class_='table')
+    if table:
+        for row in table.find('tbody').find_all('tr'):
+            cols = row.find_all('td')
+            if len(cols) >= 3:
+                resolution = cols[0].text.strip()
+                link = cols[2].find('a')
+                if link:
+                    media_url = link.get('href', '')
+                else:
+                    btn = cols[2].find('button')
+                    if btn:
+                        onclick = btn.get('onclick', '')
+                        if 'get_progressApi' in onclick:
+                            match = re.search(r"get_progressApi\('(.*?)'\)", onclick)
+                            if match:
+                                media_url = "https://snapsave.app" + match.group(1)
+                            else:
+                                media_url = ""
+                        else:
+                            media_url = ""
+                if media_url:
+                    media_list.append({
+                        "resolution": resolution,
+                        "type": "video",
+                        "url": media_url
+                    })
+    
+    # Try download-items layout
+    download_items = soup.find_all('div', class_='download-items')
+    if download_items and not media_list:
+        for item in download_items:
+            thumb = item.find('div', class_='download-items__thumb')
+            btn = item.find('div', class_='download-items__btn')
+            if btn:
+                a_tag = btn.find('a')
+                if a_tag:
+                    media_url = a_tag.get('href', '')
+                    span_text = btn.find('span').text.strip() if btn.find('span') else ""
+                    media_type = "image" if "Photo" in span_text else "video"
+                    thumbnail = ""
+                    if thumb:
+                        img = thumb.find('img')
+                        if img:
+                            thumbnail = img.get('src', '')
+                    if media_url:
+                        media_list.append({
+                            "type": media_type,
+                            "url": media_url,
+                            "thumbnail": thumbnail
+                        })
+    
+    # Try card layout
+    cards = soup.find_all('div', class_='card')
+    if cards and not media_list:
+        for card in cards:
+            card_body = card.find('div', class_='card-body')
+            if card_body:
+                a_tag = card_body.find('a')
+                if a_tag:
+                    media_url = a_tag.get('href', '')
+                    a_text = a_tag.text.strip()
+                    media_type = "image" if "Photo" in a_text else "video"
+                    if media_url:
+                        media_list.append({
+                            "type": media_type,
+                            "url": media_url
+                        })
+    
+    # Try simple layout
+    if not media_list:
+        a_tag = soup.find('a')
+        btn = soup.find('button')
+        if a_tag:
+            media_url = a_tag.get('href', '')
+            a_text = a_tag.text.strip()
+            media_type = "image" if "Photo" in a_text else "video"
+            if media_url:
+                media_list.append({
+                    "type": media_type,
+                    "url": media_url
+                })
+        elif btn:
+            onclick = btn.get('onclick', '')
+            if 'get_progressApi' in onclick:
+                match = re.search(r"get_progressApi\('(.*?)'\)", onclick)
+                if match:
+                    media_url = "https://snapsave.app" + match.group(1)
+                    media_list.append({
+                        "type": "video",
+                        "url": media_url
+                    })
+    
+    if not media_list:
+        raise Exception("SnapSave: No media found")
+    
+    return media_list
 
-    resp = requests.get(
-        BINTANGAPI_URL,
-        params={"url": clean_url},
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        raise Exception(f"BintangAPI HTTP {resp.status_code}")
-
-    data = resp.json()
-    if not data.get("status"):
-        raise Exception(f"BintangAPI error: {data.get('error', 'unknown')}")
-
-    result = data.get("result", {})
-
-    title     = result.get("title") or "-"
-    username  = result.get("username") or "-"
-    thumbnail = result.get("thumbnail") or ""
-
-    # Normalise thumbnail: bisa string atau list
-    if isinstance(thumbnail, list) and thumbnail:
-        thumbnail = thumbnail[0]
-    if not isinstance(thumbnail, str):
-        thumbnail = ""
-
-    # media[] berisi object atau string URL
-    media_list = result.get("media") or []
+def _fetch_instagram_via_snapsave(url: str) -> Dict[str, Any]:
+    """Fetch Instagram info using SnapSave"""
+    media_list = _fetch_snapsave(url)
+    
+    # Try to get title/thumbnail using yt-dlp for metadata
+    title = "Instagram Post"
+    description = ""
+    thumbnail = ""
+    channel = "Instagram"
+    is_photo = False
+    is_carousel = len(media_list) > 1
+    
+    try:
+        ydl_opts = {'quiet': True, 'no_warnings': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            meta = ydl.extract_info(url, download=False)
+            if meta:
+                title = meta.get('title', title)
+                description = meta.get('description', description)
+                channel = meta.get('uploader', channel)
+                if not thumbnail:
+                    thumbnail = meta.get('thumbnail', '')
+    except Exception as e:
+        print(f"yt-dlp metadata fetch for SnapSave failed (non-fatal): {e}")
+    
+    # Build video_formats
     video_formats = []
-    for idx, item in enumerate(media_list):
-        if isinstance(item, str):
-            media_url = item
-            ext = "mp4"
-            label = f"Video {idx + 1}" if idx > 0 else "HD"
-        elif isinstance(item, dict):
-            media_url = item.get("url") or item.get("download_url") or ""
-            ext = item.get("type", "video/mp4").split("/")[-1] if "/" in item.get("type", "") else "mp4"
-            ext = ext if ext in ("mp4", "jpg", "jpeg", "png") else "mp4"
-            label = item.get("quality") or item.get("resolution") or (f"Video {idx + 1}" if idx > 0 else "HD")
-        else:
-            continue
-
+    has_video = False
+    for idx, media in enumerate(media_list):
+        media_type = media.get('type', 'image')
+        media_url = media.get('url', '')
         if not media_url:
             continue
-
+        
+        if media_type == 'video':
+            has_video = True
+            ext = 'mp4'
+            resolution = media.get('resolution', f'Video {idx+1}')
+        else:
+            ext = 'jpg'
+            resolution = f'Foto {idx+1}'
+        
         video_formats.append({
-            "resolution": label,
-            "format_id": f"bintang_{idx}",
+            "resolution": resolution,
+            "format_id": f"snapsave_{idx}",
             "ext": ext,
-            "download_url": media_url,
+            "download_url": media_url
         })
-
-    if not video_formats:
-        raise Exception("BintangAPI: tidak ada media yang bisa diunduh")
-
+    
+    is_photo = not has_video
+    
     return {
         "title": title[:200],
-        "description": "",
+        "description": description,
         "thumbnail": thumbnail,
-        "channel": username,
+        "channel": channel,
         "duration": None,
         "video_formats": video_formats,
         "platform": "instagram",
-        "is_photo": False,
-        "is_carousel": len(video_formats) > 1,
+        "is_photo": is_photo,
+        "is_carousel": is_carousel
     }
 
 def _make_filename_slug(text: str, max_len: int = 50) -> str:
@@ -526,177 +658,27 @@ def _make_filename_slug(text: str, max_len: int = 50) -> str:
     # Truncate
     return text[:max_len] or "download"
 
-def _fetch_instagram_via_api(url: str) -> dict:
-    """
-    Fetch Instagram post info via sankavollerei API.
-    Returns dict with keys: title, thumbnail, channel, duration, video_formats, platform
-    Raises Exception on failure.
-    """
-    clean_url = url.split('?')[0] if '?' in url else url
-    api_resp = requests.get(
-        SANKAVOLLEREI_API_URL,
-        params={"apikey": SANKAVOLLEREI_API_KEY, "url": clean_url},
-        timeout=20,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-    if api_resp.status_code != 200:
-        raise Exception(f"API returned HTTP {api_resp.status_code}")
-
-    data = api_resp.json()
-    if not data.get("status"):
-        raise Exception(f"API error: {data.get('message', 'unknown')}")
-
-    result = data.get("result", {})
-    media_list = result.get("media") or []
-    if not media_list:
-        raise Exception("API returned no media")
-
-    # API often returns null for author/caption — try yt-dlp for metadata only
-    author  = result.get("author") or ""
-    caption = result.get("caption") or ""
-    if not author or not caption:
-        try:
-            # extract_flat: False needed to get uploader/description for photo posts
-            ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': False}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                meta = ydl.extract_info(url, download=False)
-            if meta:
-                if not author:
-                    # yt-dlp returns None for uploader on photo carousels,
-                    # but title is "Post by USERNAME" — extract from there
-                    raw_author = (meta.get('uploader') or meta.get('uploader_id') or
-                                  meta.get('channel') or '')
-                    if not raw_author:
-                        yt_title = meta.get('title') or ''
-                        import re as _re
-                        m = _re.match(r'^Post by (.+)$', yt_title, _re.IGNORECASE)
-                        if m:
-                            raw_author = m.group(1).strip()
-                    author = raw_author
-
-                if not caption:
-                    # description = full caption (may start with title line)
-                    desc = meta.get('description') or ''
-                    caption = desc
-        except Exception as e:
-            print(f"yt-dlp metadata fetch failed (non-fatal): {e}")
-
-    author  = author  or "Instagram"
-    caption = caption or ""
-
-    # Use first non-empty line of caption as title
-    first_line = ""
-    if caption:
-        for line in caption.splitlines():
-            line = line.strip()
-            if line:
-                first_line = line
-                break
-    title_display = first_line or author
-
-    # thumbnail: first item that has a non-null thumbnail, or first image url
-    thumbnail = ""
-    for m in media_list:
-        if m.get("thumbnail"):
-            thumbnail = m["thumbnail"]
-            break
-    if not thumbnail:
-        for m in media_list:
-            if m.get("type") == "image" and m.get("url"):
-                thumbnail = m["url"]
-                break
-
-    # Build format list — each media item becomes one entry
-    # Use a short slug of the caption as filename prefix
-    caption_slug = _make_filename_slug(first_line or author, max_len=40) or "instagram"
-
-    video_formats = []
-    photo_count = 0
-    video_count = 0
-    has_video = False
-    
-    for idx, m in enumerate(media_list):
-        mtype = m.get("type", "image")
-        murl  = m.get("url", "")
-        if not murl:
-            continue
-        if mtype == "video":
-            has_video = True
-            video_count += 1
-            ext   = "mp4"
-            label = f"Video {video_count}"
-            fname = f"{caption_slug}_video{video_count}"
-        else:
-            photo_count += 1
-            ext   = "jpg"
-            label = f"Foto {photo_count}"
-            fname = f"{caption_slug}_foto{photo_count}"
-
-        video_formats.append({
-            "resolution": label,
-            "format_id": f"api_{idx}",
-            "ext": ext,
-            "download_url": murl,
-            "filename": fname,   # suggested filename without extension
-        })
-
-    # If it's a Reel/Video URL but API returned no video, force fallback to yt-dlp
-    is_video_url = any(x in url.lower() for x in ["/reels/", "/reel/", "/tv/", "/video/"])
-    if is_video_url and not has_video:
-        print(f"Force fallback for suspected video URL: {url}")
-        raise Exception("Suspected video URL but API returned no video")
-
-    if not video_formats:
-        raise Exception("No downloadable media found")
-
-    return {
-        "title": title_display[:200],
-        "description": caption,        # full caption for display
-        "thumbnail": thumbnail,
-        "channel": author,
-        "duration": None,
-        "video_formats": video_formats,
-        "platform": "instagram",
-        "is_photo": not has_video,
-        "is_carousel": len(media_list) > 1
-    }
-
 @app.get("/instagram/info")
 def get_instagram_info(url: str):
     """
-    Get Instagram post info.
-    Tries sankavollerei API first (supports photos, carousels, reels, videos).
-    Falls back to yt-dlp for Reels/video if API fails.
+    Get Instagram post info using SnapSave.
     """
-    # --- Try API first ---
     try:
-        result = _fetch_instagram_via_api(url)
-        print(f"Instagram info via API: {len(result['video_formats'])} media items")
+        result = _fetch_instagram_via_snapsave(url)
+        print(f"Instagram info via SnapSave: {len(result['video_formats'])} media items")
         
         # Simplify labels if it's a single video
-        if not result.get("is_carousel") and not result.get("is_photo"):
+        if not result.get('is_carousel') and not result.get('is_photo'):
             for fmt in result["video_formats"]:
-                if "video" in fmt["resolution"].lower():
+                if "Video" in fmt["resolution"]:
                     fmt["resolution"] = "HD (High Quality)"
                     break
         return result
-    except HTTPException:
-        raise
-    except Exception as api_err:
-        print(f"sankavollerei API failed: {api_err}, falling back to BintangAPI")
-
-    # --- Fallback: BintangAPI (Reels / video) ---
-    try:
-        result = _fetch_instagram_via_bintangapi(url)
-        print(f"Instagram info via BintangAPI: {len(result['video_formats'])} media items")
-        return result
-    except HTTPException:
-        raise
-    except Exception as bintang_err:
-        print(f"BintangAPI failed: {bintang_err}")
+    except Exception as snapsave_err:
+        print(f"SnapSave failed: {snapsave_err}")
         raise HTTPException(
             status_code=400,
-            detail=f"Gagal mengambil info Instagram. Pastikan link valid dan post bersifat publik. ({bintang_err})"
+            detail=f"Gagal mengambil info Instagram. Pastikan link valid dan post bersifat publik. ({snapsave_err})"
         )
 
 
@@ -753,159 +735,58 @@ def proxy_image(url: str = ""):
 
 @app.get("/instagram/download")
 def download_instagram(url: str, background_tasks: BackgroundTasks, format_id: Optional[str] = "best", task_id: Optional[str] = None):
-    """Download Instagram media. Uses sankavollerei API for photos/carousels, yt-dlp for Reels/video."""
+    """Download Instagram media using SnapSave."""
     if not task_id:
         task_id = str(uuid.uuid4())
     base_name = f"temp_ig_{task_id}"
     download_progress[task_id] = {"status": "starting", "progress": 0.0}
 
-    # --- API-based download (format_id starts with "api_") ---
-    if format_id and format_id.startswith("api_"):
-        try:
-            # Re-fetch info to get the download_url for this format
-            info_resp = _fetch_instagram_via_api(url)
-            formats = info_resp.get("video_formats") or []
-
-            download_url = None
-            file_ext = "jpg"
-            for f in formats:
-                if f.get("format_id") == format_id:
-                    download_url = f.get("download_url")
-                    file_ext = f.get("ext", "jpg")
-                    break
-
-            # Fallback to first item
-            if not download_url and formats:
-                download_url = formats[0].get("download_url")
-                file_ext = formats[0].get("ext", "jpg")
-
-            if not download_url:
-                raise HTTPException(status_code=400, detail="URL media tidak ditemukan.")
-
-            download_progress[task_id] = {"status": "downloading", "progress": 0.1}
-
-            r = requests.get(
-                download_url,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-                stream=True,
-                timeout=60,
-            )
-            if r.status_code != 200:
-                raise Exception(f"Gagal download media: HTTP {r.status_code}")
-
-            file_path = f"{base_name}.{file_ext}"
-            total_size = int(r.headers.get("content-length", 0))
-            downloaded = 0
-            with open(file_path, "wb") as fh:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        fh.write(chunk)
-                        downloaded += len(chunk)
-                        if total_size > 0:
-                            download_progress[task_id] = {"status": "downloading", "progress": downloaded / total_size}
-
-            download_progress[task_id] = {"status": "completed", "progress": 1.0}
-
-            raw_title = formats[0].get("filename") or info_resp.get("title") or info_resp.get("channel") or "instagram"
-            # Use the specific format's filename if available
-            for f in formats:
-                if f.get("format_id") == format_id and f.get("filename"):
-                    raw_title = f["filename"]
-                    break
-            safe_title = re.sub(r'[\\/:*?"<>|]', '_', raw_title).strip() or f"instagram_{task_id}"
-
-            if file_ext in ("jpg", "jpeg"):
-                media_type = "image/jpeg"
-            elif file_ext == "png":
-                media_type = "image/png"
-            else:
-                media_type = "video/mp4"
-
-            from urllib.parse import quote
-            ascii_name = safe_title.encode('ascii', errors='replace').decode('ascii').replace('?', '_')
-            utf8_name  = quote(f"{safe_title}.{file_ext}", safe='')
-            content_disposition = (
-                f'attachment; filename="{ascii_name}.{file_ext}"; '
-                f"filename*=UTF-8''{utf8_name}"
-            )
-
-            def cleanup_all():
-                cleanup_files(base_name)
-                download_progress.pop(task_id, None)
-            background_tasks.add_task(cleanup_all)
-
-            from fastapi.responses import Response as FastResponse
-            return FileResponse(
-                file_path,
-                media_type=media_type,
-                headers={"Content-Disposition": content_disposition},
-            )
-        except HTTPException:
-            cleanup_files(base_name)
-            download_progress.pop(task_id, None)
-            raise
-        except Exception as e:
-            cleanup_files(base_name)
-            download_progress.pop(task_id, None)
-            raise HTTPException(status_code=400, detail=f"Instagram API download: {str(e)}")
-
-    # --- BintangAPI download (format_id starts with "bintang_") or fallback ---
-    # Re-fetch info from BintangAPI to get download_url
     try:
-        info_resp = _fetch_instagram_via_bintangapi(url)
+        # Re-fetch info to get the download_url for this format
+        info_resp = _fetch_instagram_via_snapsave(url)
         formats = info_resp.get("video_formats") or []
 
-        # Cari format yang diminta
-        target_fmt = None
-        if format_id and format_id.startswith("bintang_"):
-            for f in formats:
-                if f.get("format_id") == format_id:
-                    target_fmt = f
-                    break
+        download_url = None
+        file_ext = "jpg"
+        for f in formats:
+            if f.get("format_id") == format_id:
+                download_url = f.get("download_url")
+                file_ext = f.get("ext", "jpg")
+                break
 
-        # Fallback ke format pertama (HD)
-        if not target_fmt and formats:
-            target_fmt = formats[0]
+        # Fallback to first item
+        if not download_url and formats:
+            download_url = formats[0].get("download_url")
+            file_ext = formats[0].get("ext", "jpg")
 
-        if not target_fmt or not target_fmt.get("download_url"):
+        if not download_url:
             raise HTTPException(status_code=400, detail="URL media tidak ditemukan.")
-
-        download_url = target_fmt["download_url"]
-        file_ext     = target_fmt.get("ext", "mp4")
-        raw_title    = info_resp.get("title") or info_resp.get("channel") or "instagram"
 
         download_progress[task_id] = {"status": "downloading", "progress": 0.1}
 
         r = requests.get(
             download_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://www.instagram.com/",
-            },
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             stream=True,
-            timeout=(30, 600),
+            timeout=60,
         )
         if r.status_code != 200:
             raise Exception(f"Gagal download media: HTTP {r.status_code}")
 
-        file_path  = f"{base_name}.{file_ext}"
+        file_path = f"{base_name}.{file_ext}"
         total_size = int(r.headers.get("content-length", 0))
         downloaded = 0
         with open(file_path, "wb") as fh:
-            for chunk in r.iter_content(chunk_size=65536):
+            for chunk in r.iter_content(chunk_size=8192):
                 if chunk:
                     fh.write(chunk)
                     downloaded += len(chunk)
                     if total_size > 0:
-                        download_progress[task_id] = {
-                            "status": "downloading",
-                            "progress": downloaded / total_size,
-                            "speed": "",
-                            "total": f"{total_size / 1048576:.1f}MB",
-                        }
+                        download_progress[task_id] = {"status": "downloading", "progress": downloaded / total_size}
 
         download_progress[task_id] = {"status": "completed", "progress": 1.0}
 
+        raw_title = info_resp.get("title") or info_resp.get("channel") or "instagram"
         safe_title = re.sub(r'[\\/:*?"<>|]', '_', raw_title).strip() or f"instagram_{task_id}"
 
         if file_ext in ("jpg", "jpeg"):
@@ -954,7 +835,7 @@ def download_instagram_all(url: str, background_tasks: BackgroundTasks, task_id:
     download_progress[task_id] = {"status": "starting", "progress": 0.0}
 
     try:
-        info_resp = _fetch_instagram_via_api(url)
+        info_resp = _fetch_instagram_via_snapsave(url)
         formats   = info_resp.get("video_formats") or []
         if not formats:
             raise HTTPException(status_code=400, detail="Tidak ada media yang bisa di-download.")
@@ -968,7 +849,7 @@ def download_instagram_all(url: str, background_tasks: BackgroundTasks, task_id:
             for i, fmt in enumerate(formats):
                 dl_url  = fmt.get("download_url")
                 ext     = fmt.get("ext", "jpg")
-                fname   = fmt.get("filename") or f"media_{i+1}"
+                fname   = f"media_{i+1}"
                 safe_fn = _make_filename_slug(fname) or f"media_{i+1}"
                 arcname = f"{safe_fn}.{ext}"
 

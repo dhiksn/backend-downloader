@@ -774,22 +774,24 @@ def handle_instagram(url: str, save_dir: str):
     ui_info_card(title, channel, custom_fields=ig_fields)
 
     task_id   = str(int(time.time() * 1000))
-    api_fmts  = [f for f in formats if f.get("format_id", "").startswith("api_")]
+    # Now use all formats since we only have snapsave_
+    display_fmts = formats
 
-    if is_photo and is_carousel:
+    # Check if it's a carousel (even if mix of photos and videos)
+    if len(display_fmts) > 1:
         console.print(
             f"\n  [bright_black]Carousel detected[/]  "
-            f"[cyan]{len(api_fmts)}[/] [dim]photos[/]"
+            f"[cyan]{len(display_fmts)}[/] [dim]media items[/]"
         )
         while True:
             choice = ui_prompt_choice(
                 "Select action",
-                ["Download one photo", "Download all as ZIP"],
+                ["Download one item", "Download all as ZIP"],
             )
             if choice == "1":
-                options = [f["resolution"] for f in api_fmts]
+                options = [f["resolution"] for f in display_fmts]
                 options.append("[yellow]Back[/]")
-                idx_str = ui_prompt_choice("Select photo", options)
+                idx_str = ui_prompt_choice("Select item", options)
                 try:
                     idx = int(idx_str) - 1
                     if idx == len(options) - 1: # Back
@@ -797,18 +799,18 @@ def handle_instagram(url: str, save_dir: str):
                         ui_banner()
                         ui_info_card(title, channel, custom_fields=ig_fields)
                         continue
-                    fmt = api_fmts[idx]
+                    fmt = display_fmts[idx]
                 except (ValueError, IndexError):
                     ui_warn("Invalid selection.")
                     continue
                 ext       = fmt.get("ext", "jpg")
-                save_path = os.path.join(save_dir, f"{safe_filename(title)}_foto{idx + 1}.{ext}")
+                save_path = os.path.join(save_dir, f"{safe_filename(title)}_item{idx + 1}.{ext}")
                 endpoint  = (
                     f"{BACKEND_URL}/instagram/download"
                     f"?url={requests.utils.quote(url)}"
                     f"&format_id={fmt['format_id']}&task_id={task_id}"
                 )
-                final = download_file(endpoint, save_path, f"Photo {idx + 1}")
+                final = download_file(endpoint, save_path, f"Item {idx + 1}")
                 ui_success(os.path.basename(final), os.path.dirname(final))
                 break
 
