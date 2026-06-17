@@ -76,7 +76,7 @@ def load_config():
     """Load configuration from JSON file."""
     defaults = {
         "download_dir": os.path.join(os.path.expanduser("~"), "Music"),
-        "backend_url": "http://node4.dayy.web.id:2022"
+        "backend_url": "http://node4.dayy.web.id:5536"
     }
     if os.path.exists(CONFIG_FILE):
         try:
