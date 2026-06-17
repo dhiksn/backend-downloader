@@ -591,9 +591,23 @@ def _fetch_instagram_via_snapsave(url: str) -> Dict[str, Any]:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             meta = ydl.extract_info(url, download=False)
             if meta:
-                title = meta.get('title', title)
+                raw_title = meta.get('title', title)
                 description = meta.get('description', description)
-                channel = meta.get('uploader', channel)
+                
+                # Extract channel/uploader
+                if meta.get('uploader'):
+                    channel = f"@{meta.get('uploader')}"
+                elif meta.get('channel'):
+                    channel = f"@{meta.get('channel')}"
+                elif raw_title.startswith("Post by "):
+                    channel = f"@{raw_title[8:]}"
+                elif raw_title.startswith("Video by "):
+                    channel = f"@{raw_title[9:]}"
+                elif raw_title.startswith("Photo by "):
+                    channel = f"@{raw_title[9:]}"
+
+                title = raw_title
+
                 if not thumbnail:
                     thumbnail = meta.get('thumbnail', '')
     except Exception as e:
@@ -1378,9 +1392,11 @@ def download_video(url: str, format_id: str, background_tasks: BackgroundTasks, 
         ],
         'extractor_args': {
             'youtube': {
-                'player_client': ['android_creator'],
+                'player_client': ['ios', 'default'],
             }
         },
+        'concurrent_fragment_downloads': 8,
+        'http_chunk_size': 10485760,
         'js_runtimes': {'node': {}},
         'remote_components': {'ejs:github'},  # tambahkan ini
         'geo_bypass': True,
@@ -1428,8 +1444,7 @@ def download_audio(url: str, background_tasks: BackgroundTasks, task_id: Optiona
     if not task_id:
         task_id = str(uuid.uuid4())
     base_name = f"temp_{task_id}"
-    # Fixed output path — yt-dlp will convert to .mp3 via FFmpegExtractAudio
-    output_mp3 = f"{base_name}.mp3"
+    output_m4a = f"{base_name}.m4a"
 
     download_progress[task_id] = {"status": "starting", "progress": 0.0}
 
@@ -1459,42 +1474,23 @@ def download_audio(url: str, background_tasks: BackgroundTasks, task_id: Optiona
         elif d['status'] == 'finished':
             download_progress[task_id] = {"status": "processing", "progress": 1.0}
 
-    # Download best audio, convert to MP3, embed metadata + thumbnail
-    # Postprocessor order matters:
-    #   1. FFmpegExtractAudio  — convert to mp3
-    #   2. FFmpegMetadata      — write title/artist/etc tags
-    #   3. ThumbnailsConvertor — convert webp/png thumbnail → jpg (required for ID3 embed)
-    #   4. EmbedThumbnail      — embed jpg thumbnail into mp3 ID3 tag
     ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
+        'format': '140/m4a/bestaudio',
         'outtmpl': f"{base_name}.%(ext)s",
         'quiet': True,
-        'writethumbnail': True,   # needed so EmbedThumbnail has something to embed
+        'writethumbnail': True,
         'progress_hooks': [my_hook],
         'postprocessors': [
-            {
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            },
-            {
-                'key': 'FFmpegMetadata',
-                'add_metadata': True,
-            },
-            {
-                # Convert thumbnail to jpg first — EmbedThumbnail needs jpg for MP3
-                'key': 'FFmpegThumbnailsConvertor',
-                'format': 'jpg',
-            },
-            {
-                'key': 'EmbedThumbnail',
-            },
+            {'key': 'FFmpegMetadata'},
+            {'key': 'EmbedThumbnail'},
         ],
         'extractor_args': {
             'youtube': {
-                'player_client': ['android_creator'],
+                'player_client': ['ios', 'default'],
             }
         },
+        'concurrent_fragment_downloads': 8,
+        'http_chunk_size': 10485760,
         'geo_bypass': True,
         'geo_bypass_country': 'US',
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -1505,29 +1501,22 @@ def download_audio(url: str, background_tasks: BackgroundTasks, task_id: Optiona
     info = None
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Extract info first (for title), then download
             info = ydl.extract_info(url, download=False)
             ydl.download([url])
 
-        # After FFmpegExtractAudio, the file should be base_name.mp3
-        if not os.path.isfile(output_mp3):
-            # Fallback: search for any .mp3 with this base
-            mp3_files = glob.glob(f"{base_name}*.mp3")
-            if not mp3_files:
-                raise Exception("MP3 file not found after conversion")
-            output_mp3_actual = mp3_files[0]
+        # After downloading, the file should be base_name.m4a
+        if not os.path.isfile(output_m4a):
+            # Fallback: search for any file with this base
+            files = glob.glob(f"{base_name}*")
+            if not files:
+                raise Exception("Audio file not found after download")
+            output_actual = files[0]
         else:
-            output_mp3_actual = output_mp3
+            output_actual = output_m4a
 
-        # Verify the file is a valid MP3 (starts with ID3 or 0xFF 0xFB/0xF3/0xF2)
-        with open(output_mp3_actual, 'rb') as f:
-            header = f.read(3)
-        if header[:3] not in (b'ID3', b'\xff\xfb', b'\xff\xf3', b'\xff\xf2'):
-            raise Exception(f"Output file is not a valid MP3 (header: {header.hex()})")
-
-        # Clean up any leftover thumbnail/temp files (not the mp3)
+        # Clean up any leftover temp files
         for leftover in glob.glob(f"{base_name}*"):
-            if leftover != output_mp3_actual:
+            if leftover != output_actual:
                 try:
                     os.remove(leftover)
                 except Exception:
@@ -1539,6 +1528,18 @@ def download_audio(url: str, background_tasks: BackgroundTasks, task_id: Optiona
         if not safe_title:
             safe_title = str(uuid.uuid4())
 
+
+        # HTTP headers only support latin-1 — use RFC 5987 encoding for Unicode filenames
+        from urllib.parse import quote
+        ascii_filename = safe_title.encode('ascii', errors='replace').decode('ascii').replace('?', '_')
+        utf8_filename = quote(f"{safe_title}.m4a", safe='')
+        content_disposition = (
+            f'attachment; filename="{ascii_filename}.m4a"; '
+            f"filename*=UTF-8''{utf8_filename}"
+        )
+
+        ext = output_actual.split('.')[-1]
+        
         def cleanup_all():
             cleanup_files(base_name)
             download_progress.pop(task_id, None)
@@ -1546,18 +1547,9 @@ def download_audio(url: str, background_tasks: BackgroundTasks, task_id: Optiona
         background_tasks.add_task(cleanup_all)
         download_progress[task_id] = {"status": "completed", "progress": 1.0}
 
-        # HTTP headers only support latin-1 — use RFC 5987 encoding for Unicode filenames
-        from urllib.parse import quote
-        ascii_filename = safe_title.encode('ascii', errors='replace').decode('ascii').replace('?', '_')
-        utf8_filename = quote(f"{safe_title}.mp3", safe='')
-        content_disposition = (
-            f'attachment; filename="{ascii_filename}.mp3"; '
-            f"filename*=UTF-8''{utf8_filename}"
-        )
-
         return FileResponse(
-            output_mp3_actual,
-            media_type="audio/mpeg",
+            output_actual,
+            media_type=f"audio/{ext}",
             headers={"Content-Disposition": content_disposition},
         )
     except Exception as e:
@@ -1571,5 +1563,5 @@ def download_audio(url: str, background_tasks: BackgroundTasks, task_id: Optiona
 if __name__ == "__main__":
     import uvicorn
     import os
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("SERVER_PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)

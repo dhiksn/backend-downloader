@@ -76,7 +76,7 @@ def load_config():
     """Load configuration from JSON file."""
     defaults = {
         "download_dir": os.path.join(os.path.expanduser("~"), "Music"),
-        "backend_url": "http://127.0.0.1:8000"
+        "backend_url": "http://node4.dayy.web.id:5536"
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -381,7 +381,7 @@ def download_file(url: str, save_path: str, label: str = "Downloading") -> str:
         if m:
             final_name = unquote(m.group(1))
         if not final_name:
-            m = re.search(r'filename\s*=\s*"?([^";\s]+)"?', cd, re.IGNORECASE)
+            m = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, re.IGNORECASE)
             if m:
                 final_name = m.group(1)
         
@@ -475,7 +475,7 @@ def poll_progress(task_id: str, label: str = "Processing", stop_event: threading
             label_str = f"  [dim]{label}[/]" if not extras else ""
 
             console.print(
-                f"  [cyan]{spinner[i % len(spinner)]}[/]  {bar}  {pct}{extra_str}{label_str}",
+                f"  [cyan]{spinner[i % len(spinner)]}[/]  {bar}  {pct}{extra_str}{label_str}                    ",
                 end="\r",
             )
             i += 1
@@ -555,23 +555,29 @@ def handle_youtube(url: str, save_dir: str):
     channel  = info.get("channel", "")
     duration = info.get("duration", 0)
     formats  = info.get("video_formats", [])
-    mins, secs = divmod(int(duration or 0), 60)
+    dur_int = int(duration or 0)
+    hours, remainder = divmod(dur_int, 3600)
+    mins, secs = divmod(remainder, 60)
+    if hours > 0:
+        dur_str = f"{hours}:{mins:02d}:{secs:02d} duration"
+    else:
+        dur_str = f"{mins}:{secs:02d} duration"
 
-    ui_info_card(title, channel, f"{mins}:{secs:02d} duration")
+    ui_info_card(title, channel, dur_str)
 
     while True:
-        choice = ui_prompt_choice("Select format", ["MP3  (audio only)", "MP4  (video)"])
+        choice = ui_prompt_choice("Select format", ["M4A  (audio only)", "MP4  (video)"])
         task_id = str(int(time.time() * 1000))
 
         if choice == "1":
-            save_path = os.path.join(save_dir, f"{safe_filename(title)}.mp3")
+            save_path = os.path.join(save_dir, f"{safe_filename(title)}.m4a")
             endpoint  = (
                 f"{BACKEND_URL}/download/audio"
                 f"?url={requests.utils.quote(url)}&task_id={task_id}"
             )
             stop_event = threading.Event()
             poll = threading.Thread(
-                target=poll_progress, args=(task_id, "Converting to MP3", stop_event), daemon=True
+                target=poll_progress, args=(task_id, "Processing M4A", stop_event), daemon=True
             )
             poll.start()
             final = download_file(endpoint, save_path, f"{title[:35]}…" if len(title) > 35 else title)
@@ -590,7 +596,7 @@ def handle_youtube(url: str, save_dir: str):
                 if idx == len(options) - 1: # User chose "Back"
                     ui_clear()
                     ui_banner()
-                    ui_info_card(title, channel, f"{mins}:{secs:02d} duration")
+                    ui_info_card(title, channel, dur_str)
                     continue
                 fmt = formats[idx]
             except (ValueError, IndexError):
