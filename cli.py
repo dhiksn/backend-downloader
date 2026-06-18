@@ -76,7 +76,8 @@ def load_config():
     """Load configuration from JSON file."""
     defaults = {
         "download_dir": os.path.join(os.path.expanduser("~"), "Music"),
-        "backend_url": "http://node4.dayy.web.id:5536"
+        # "backend_url": "http://node4.dayy.web.id:5536"
+        "backend_url": "http://127.0.0.1:8000"
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -231,7 +232,7 @@ def ui_prompt_url() -> str:
         raw = pt_prompt(
             HTML('<ansibrightblack>  ❯ </ansibrightblack><ansicyan>URL  </ansicyan>'),
             style=PT_STYLE,
-            placeholder="  paste YouTube · TikTok · Instagram link",
+            placeholder="  paste YouTube · TikTok · Instagram · Spotify link",
         )
         return raw.strip()
     except (KeyboardInterrupt, EOFError):
@@ -341,9 +342,9 @@ def ui_warn(message: str):
 
 
 def ui_platform_badge(platform: str):
-    colours = {"youtube": "red", "tiktok": "bright_magenta", "instagram": "yellow"}
+    colours = {"youtube": "red", "tiktok": "bright_magenta", "instagram": "yellow", "spotify": "green"}
     col = colours.get(platform.lower(), "cyan")
-    icons = {"youtube": "▶", "tiktok": "♪", "instagram": "◈"}
+    icons = {"youtube": "▶", "tiktok": "♪", "instagram": "◈", "spotify": "♫"}
     icon = icons.get(platform.lower(), "⚡")
     console.print(
         f"\n  [{col}]{icon}[/]  [bold {col}]{platform.upper()}[/]  [bright_black]detected[/]"
@@ -497,6 +498,8 @@ def detect_platform(url: str) -> str:
         return "tiktok"
     if "instagram.com" in url:
         return "instagram"
+    if "open.spotify.com/track" in url:
+        return "spotify"
     return "unknown"
 
 
@@ -897,6 +900,115 @@ def handle_instagram(url: str, save_dir: str):
             break
 
 
+def handle_spotify(url: str, save_dir: str):
+    # Strip tracking params — keep only the track ID portion
+    clean_url = url.split("?")[0]
+
+    with Progress(
+        TextColumn("  "),
+        SpinnerColumn("dots", style="green"),
+        TextColumn("[dim]Fetching Spotify info...[/]"),
+        console=console,
+        transient=True,
+    ) as pg:
+        pg.add_task("")
+        r = requests.get(f"{BACKEND_URL}/spotify/info", params={"url": clean_url}, timeout=30)
+
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("detail", r.text)
+        except Exception:
+            detail = r.text
+        ui_error(detail)
+        return
+
+    info    = r.json()
+    title   = info.get("title", "Unknown")
+    artist  = info.get("artist", "")
+    album   = info.get("album", "")
+    raw_dur = info.get("duration", 0) or 0
+
+    # Parse duration — API may return "3:45" (mm:ss string), int seconds, or int ms
+    dur_str = "—"
+    try:
+        if isinstance(raw_dur, str) and ":" in raw_dur:
+            # Already "m:ss" or "h:mm:ss" format — use as-is
+            dur_str = raw_dur.strip()
+        else:
+            dur_sec = int(float(str(raw_dur)))
+            if dur_sec > 9999:          # milliseconds → seconds
+                dur_sec = dur_sec // 1000
+            if dur_sec > 0:
+                mins, secs = divmod(dur_sec, 60)
+                dur_str = f"{mins}:{secs:02d}"
+    except (ValueError, TypeError):
+        pass
+
+    sp_fields = {
+        "Title":    title[:80] + "..." if len(title) > 80 else title,
+        "Artist":   artist,
+        "Album":    album if album else "—",
+        "Duration": dur_str,
+    }
+    # Reuse ui_info_card with custom_fields
+    console.print()
+    from rich.table import Table as _Table
+    grid = _Table.grid(padding=(0, 2))
+    grid.add_column(style="bright_black", min_width=10)
+    grid.add_column(style="white")
+    for label, value in sp_fields.items():
+        if value:
+            grid.add_row(label, value)
+    from rich.panel import Panel as _Panel
+    from rich.padding import Padding as _Padding
+    console.print(_Panel(
+        _Padding(grid, (0, 1)),
+        title="[bold white]♫  Spotify Track[/]",
+        border_style="green",
+        padding=(1, 2),
+    ))
+
+    # ── Confirmation prompt ───────────────────────────────────────────────
+    console.print()
+    try:
+        confirm = pt_prompt(
+            HTML('<ansibrightblack>  ❯ </ansibrightblack><ansiwhite>Download MP3? </ansiwhite><ansibrightblack>[Y/n]  </ansibrightblack>'),
+            style=PT_STYLE,
+        ).strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return
+
+    if confirm not in ("y", "yes", "1", ""):
+        console.print("\n  [bright_black]Dibatalkan.[/]\n")
+        return
+
+    task_id   = str(int(time.time() * 1000))
+    save_name = safe_filename(f"{artist} - {title}" if artist else title)
+    save_path = os.path.join(save_dir, f"{save_name}.mp3")
+    endpoint  = (
+        f"{BACKEND_URL}/spotify/download"
+        f"?url={requests.utils.quote(clean_url)}&task_id={task_id}"
+    )
+
+    stop_event = threading.Event()
+    poll = threading.Thread(
+        target=poll_progress,
+        args=(task_id, "Downloading MP3", stop_event),
+        daemon=True,
+    )
+    poll.start()
+
+    try:
+        final = download_file(endpoint, save_path, f"{title[:40]} · MP3")
+        stop_event.set()
+        poll.join(timeout=2)
+        ui_success(os.path.basename(final), os.path.dirname(final))
+    except Exception as exc:
+        stop_event.set()
+        poll.join(timeout=2)
+        raise exc
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CHANGE FOLDER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1035,7 +1147,7 @@ def main():
 
         # ── Validate URL ──────────────────────────────────────────────────
         if not url.startswith("http"):
-            ui_warn("That doesn't look like a URL. Paste a YouTube, TikTok, or Instagram link.")
+            ui_warn("That doesn't look like a URL. Paste a YouTube, TikTok, Instagram, or Spotify link.")
             time.sleep(1)
             continue
 
@@ -1043,7 +1155,7 @@ def main():
         ui_platform_badge(platform)
 
         if platform == "unknown":
-            ui_error("Platform not supported. Only YouTube · TikTok · Instagram.")
+            ui_error("Platform not supported. Only YouTube · TikTok · Instagram · Spotify.")
             time.sleep(1)
             continue
 
@@ -1055,6 +1167,8 @@ def main():
                 handle_tiktok(url, DOWNLOAD_DIR)
             elif platform == "instagram":
                 handle_instagram(url, DOWNLOAD_DIR)
+            elif platform == "spotify":
+                handle_spotify(url, DOWNLOAD_DIR)
         except KeyboardInterrupt:
             console.print()
             console.print(f"\n  [bold yellow]⚠[/]  [yellow]Download cancelled.[/]\n")
