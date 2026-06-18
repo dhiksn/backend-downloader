@@ -1560,6 +1560,160 @@ def download_audio(url: str, background_tasks: BackgroundTasks, task_id: Optiona
         print(traceback.format_exc())
         raise HTTPException(status_code=400, detail=str(e))
 
+# --- Spotify Endpoints ---
+
+def _fetch_spotify_info(track_url: str) -> Dict[str, Any]:
+    """Call musicfab.io API to get Spotify track metadata and download URL."""
+    import json as _json
+
+    payload = _json.dumps({"url": track_url}).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Content-Length": str(len(payload)),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+
+    resp = requests.post(
+        "https://musicfab.io/api/spotify",
+        data=payload,
+        headers=headers,
+        timeout=30,
+    )
+
+    if resp.status_code != 200:
+        raise Exception(f"API returned HTTP {resp.status_code}")
+
+    data = resp.json()
+    metadata = (data.get("data") or {}).get("metadata")
+    if not metadata or not metadata.get("download"):
+        raise Exception("Download URL not found in API response")
+
+    raw_duration = metadata.get("duration")
+    print(f"[Spotify] raw duration from API: {raw_duration!r} (type: {type(raw_duration).__name__})")
+
+    return {
+        "title": metadata.get("name") or "Unknown",
+        "artist": metadata.get("artist") or "Unknown",
+        "album": metadata.get("album") or "",
+        "duration": raw_duration or 0,
+        "thumbnail": metadata.get("image") or "",
+        "download_url": metadata["download"],
+    }
+
+
+@app.get("/spotify/info")
+def get_spotify_info(url: str):
+    """Get Spotify track metadata and download URL."""
+    try:
+        if not url:
+            raise HTTPException(status_code=400, detail="URL required")
+        if "open.spotify.com/track" not in url:
+            raise HTTPException(
+                status_code=400,
+                detail="Only Spotify track URLs are supported (open.spotify.com/track/...)",
+            )
+
+        info = _fetch_spotify_info(url)
+        return {
+            "title": info["title"],
+            "artist": info["artist"],
+            "album": info["album"],
+            "duration": info["duration"],
+            "thumbnail": info["thumbnail"],
+            "download_url": info["download_url"],
+            "platform": "spotify",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Gagal mengambil info Spotify: {str(e)}")
+
+
+@app.get("/spotify/download")
+def download_spotify(url: str, background_tasks: BackgroundTasks, task_id: Optional[str] = None):
+    """Download a Spotify track as MP3."""
+    if not task_id:
+        task_id = str(uuid.uuid4())
+    base_name = f"temp_spotify_{task_id}"
+    dest_path = f"{base_name}.mp3"
+
+    download_progress[task_id] = {"status": "starting", "progress": 0.0}
+
+    try:
+        if not url:
+            raise HTTPException(status_code=400, detail="URL required")
+        if "open.spotify.com/track" not in url:
+            raise HTTPException(
+                status_code=400,
+                detail="Only Spotify track URLs are supported (open.spotify.com/track/...)",
+            )
+
+        download_progress[task_id] = {"status": "downloading", "progress": 0.1, "total": "Fetching info...", "speed": ""}
+
+        info = _fetch_spotify_info(url)
+
+        download_progress[task_id] = {"status": "downloading", "progress": 0.2, "total": "Downloading...", "speed": ""}
+
+        r = requests.get(
+            info["download_url"],
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            stream=True,
+            timeout=60,
+        )
+        if r.status_code != 200:
+            raise Exception(f"Gagal download audio: HTTP {r.status_code}")
+
+        total_size = int(r.headers.get("content-length", 0))
+        downloaded = 0
+        with open(dest_path, "wb") as fh:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        progress = 0.2 + (downloaded / total_size) * 0.8
+                        total_mb = total_size / (1024 * 1024)
+                        total_str = f"{total_mb:.1f}MB"
+                        download_progress[task_id] = {
+                            "status": "downloading",
+                            "progress": progress,
+                            "total": total_str,
+                            "speed": "",
+                        }
+
+        download_progress[task_id] = {"status": "completed", "progress": 1.0}
+
+        safe_title = _make_filename_slug(f"{info['artist']} - {info['title']}", max_len=60) or f"spotify_{task_id}"
+
+        from urllib.parse import quote
+        ascii_name = safe_title.encode("ascii", errors="replace").decode("ascii").replace("?", "_")
+        utf8_name = quote(f"{safe_title}.mp3", safe="")
+        content_disposition = (
+            f'attachment; filename="{ascii_name}.mp3"; '
+            f"filename*=UTF-8''{utf8_name}"
+        )
+
+        def cleanup_all():
+            cleanup_files(base_name)
+            download_progress.pop(task_id, None)
+        background_tasks.add_task(cleanup_all)
+
+        return FileResponse(
+            dest_path,
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": content_disposition},
+        )
+
+    except HTTPException:
+        cleanup_files(base_name)
+        download_progress.pop(task_id, None)
+        raise
+    except Exception as e:
+        cleanup_files(base_name)
+        download_progress.pop(task_id, None)
+        raise HTTPException(status_code=400, detail=f"Spotify download gagal: {str(e)}")
+
+
 if __name__ == "__main__":
     import uvicorn
     import os
