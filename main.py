@@ -1563,20 +1563,13 @@ def download_audio(url: str, background_tasks: BackgroundTasks, task_id: Optiona
 # --- Spotify Endpoints ---
 
 def _fetch_spotify_info(track_url: str) -> Dict[str, Any]:
-    """Call musicfab.io API to get Spotify track metadata and download URL."""
-    import json as _json
+    """Call prenivapi to get Spotify track metadata and download URL."""
+    clean_url = track_url.split("?")[0]
+    api_url = f"https://prenivapi.vercel.app/api/spotify?url={requests.utils.quote(clean_url, safe='')}"
 
-    payload = _json.dumps({"url": track_url}).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "Content-Length": str(len(payload)),
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
-
-    resp = requests.post(
-        "https://musicfab.io/api/spotify",
-        data=payload,
-        headers=headers,
+    resp = requests.get(
+        api_url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
         timeout=30,
     )
 
@@ -1584,20 +1577,33 @@ def _fetch_spotify_info(track_url: str) -> Dict[str, Any]:
         raise Exception(f"API returned HTTP {resp.status_code}")
 
     data = resp.json()
-    metadata = (data.get("data") or {}).get("metadata")
-    if not metadata or not metadata.get("download"):
-        raise Exception("Download URL not found in API response")
+    if not data.get("status") or not data.get("data"):
+        raise Exception("API returned unsuccessful response")
 
-    raw_duration = metadata.get("duration")
-    print(f"[Spotify] raw duration from API: {raw_duration!r} (type: {type(raw_duration).__name__})")
+    d = data["data"]
+    downloads = d.get("downloads") or []
+    if not downloads:
+        raise Exception("No download URLs found")
+
+    # Pick best quality — sort by kbps descending
+    def kbps(dl):
+        try: return int(str(dl.get("quality", "0")).replace("kbps", "").strip())
+        except: return 0
+
+    best = max(downloads, key=kbps)
+
+    duration = d.get("duration") or 0
+    print(f"[Spotify] title={d.get('title')!r} author={d.get('author')!r} duration={duration!r} quality={best.get('quality')!r}")
 
     return {
-        "title": metadata.get("name") or "Unknown",
-        "artist": metadata.get("artist") or "Unknown",
-        "album": metadata.get("album") or "",
-        "duration": raw_duration or 0,
-        "thumbnail": metadata.get("image") or "",
-        "download_url": metadata["download"],
+        "title":        d.get("title")     or "Unknown",
+        "artist":       d.get("author")    or "Unknown",
+        "album":        d.get("album")     or "",
+        "duration":     duration,
+        "thumbnail":    d.get("thumbnail") or "",
+        "download_url": best["url"],
+        "quality":      best.get("quality") or "",
+        "format":       best.get("format")  or "mp3",
     }
 
 
@@ -1615,13 +1621,15 @@ def get_spotify_info(url: str):
 
         info = _fetch_spotify_info(url)
         return {
-            "title": info["title"],
-            "artist": info["artist"],
-            "album": info["album"],
-            "duration": info["duration"],
-            "thumbnail": info["thumbnail"],
+            "title":        info["title"],
+            "artist":       info["artist"],
+            "album":        info["album"],
+            "duration":     info["duration"],
+            "thumbnail":    info["thumbnail"],
             "download_url": info["download_url"],
-            "platform": "spotify",
+            "quality":      info["quality"],
+            "format":       info["format"],
+            "platform":     "spotify",
         }
     except HTTPException:
         raise
