@@ -31,12 +31,23 @@ app.add_middleware(
 )
 
 def cleanup_files(base_name: str):
-    """Delete files starting with base_name"""
+    """Delete files starting with base_name (base_name must be an absolute path prefix)"""
     for f in glob.glob(f"{base_name}*"):
         try:
             os.remove(f)
         except:
             pass
+
+
+def _startup_cleanup():
+    """Delete leftover temp_* files from previous runs."""
+    for f in glob.glob(os.path.join(backend_dir, "temp_*")):
+        try:
+            os.remove(f)
+        except:
+            pass
+
+_startup_cleanup()
 
 download_progress = {}
 # Guard: task_id yang sedang aktif di-download, cegah request duplikat
@@ -304,74 +315,87 @@ def _fetch_tikwm_slideshow(url: str) -> Dict[str, Any]:
 
 @app.get("/tiktok/info")
 def get_tiktok_info(url: str):
-    """Get TikTok video/slideshow info via prenivapi (video) or TikWM (slideshow fallback)."""
+    """Get TikTok video/slideshow info via prenivapi (video) or TikWM (slideshow)."""
     try:
         print(f"Fetching TikTok info: {url}")
 
-        # ── Try prenivapi first (video posts) ────────────────────────────────
-        try:
-            d = _fetch_prenivapi_tiktok(url)
-            downloads = d.get("downloads") or {}
-            video_list = downloads.get("video") or []
-            audio_list = downloads.get("audio") or []
+        # ── Deteksi slideshow dari URL sebelum request apapun ────────────────
+        is_likely_photo = '/photo/' in url
 
-            title     = d.get("title") or "TikTok Video"
-            thumbnail = d.get("thumbnail") or ""
-            author    = d.get("author") or ""
-            channel   = f"@{author}" if author else "TikTok"
-            duration  = 0
-            metadata  = d.get("metadata") or {}
+        if not is_likely_photo:
+            # ── Try prenivapi dulu untuk video biasa ─────────────────────────
+            try:
+                d = _fetch_prenivapi_tiktok(url)
+                downloads = d.get("downloads") or {}
+                video_list = downloads.get("video") or []
+                audio_list = downloads.get("audio") or []
 
-            video_formats = []
-            if video_list:
-                # prenivapi returns one video URL (no HD/SD distinction visible)
-                video_formats.append({
-                    "resolution": "HD Quality",
-                    "format_id": "hd",
-                    "ext": "mp4",
-                    "download_url": video_list[0]["url"],
-                })
-                # If more than one entry, add second as SD
-                if len(video_list) > 1:
+                title     = d.get("title") or "TikTok Video"
+                thumbnail = d.get("thumbnail") or ""
+                author    = d.get("author") or ""
+
+                # prenivapi sering return author=null — ambil dari TikWM
+                if not author:
+                    try:
+                        vdata_meta = _fetch_tikwm_slideshow(url)
+                        meta_author = vdata_meta.get("author") or {}
+                        username = meta_author.get("unique_id") or ""
+                        nickname = meta_author.get("nickname") or ""
+                        if username:
+                            author = f"{username} ({nickname})" if nickname and nickname != username else username
+                        if not thumbnail:
+                            thumbnail = vdata_meta.get("cover") or vdata_meta.get("origin_cover") or ""
+                    except Exception:
+                        pass
+
+                channel = f"@{author}" if author else "TikTok"
+
+                video_formats = []
+                if video_list:
                     video_formats.append({
-                        "resolution": "Standard Quality",
-                        "format_id": "sd",
+                        "resolution": "HD Quality",
+                        "format_id": "hd",
                         "ext": "mp4",
-                        "download_url": video_list[1]["url"],
+                        "download_url": video_list[0]["url"],
                     })
+                    if len(video_list) > 1:
+                        video_formats.append({
+                            "resolution": "Standard Quality",
+                            "format_id": "sd",
+                            "ext": "mp4",
+                            "download_url": video_list[1]["url"],
+                        })
 
-            if not video_formats:
-                raise Exception("No video URLs in prenivapi response")
+                if not video_formats:
+                    raise Exception("No video URLs in prenivapi response")
 
-            print(f"prenivapi OK: {title!r} — {len(video_formats)} video format(s)")
-            return {
-                "title": title,
-                "thumbnail": thumbnail,
-                "channel": channel,
-                "duration": duration,
-                "description": title,
-                "video_formats": video_formats,
-                "platform": "tiktok",
-                "play_count": 0,
-                "is_photo": False,
-                # Store audio URL for MP3 downloads
-                "_audio_url": audio_list[0]["url"] if audio_list else "",
-            }
+                print(f"prenivapi OK: {title!r} — {len(video_formats)} video format(s)")
+                return {
+                    "title": title,
+                    "thumbnail": thumbnail,
+                    "channel": channel,
+                    "duration": 0,
+                    "description": title,
+                    "video_formats": video_formats,
+                    "platform": "tiktok",
+                    "play_count": 0,
+                    "is_photo": False,
+                    "_audio_url": audio_list[0]["url"] if audio_list else "",
+                }
+            except Exception as preniv_err:
+                print(f"prenivapi failed ({preniv_err}), falling back to TikWM...")
 
-        except Exception as preniv_err:
-            print(f"prenivapi failed ({preniv_err}), trying TikWM for slideshow fallback...")
-
-        # ── Fallback: TikWM (handles slideshows + videos) ─────────────────────
-        vdata     = _fetch_tikwm_slideshow(url)
-        title     = vdata.get("title") or "TikTok Video"
-        author    = vdata.get("author") or {}
-        username  = author.get("unique_id") or "Unknown"
-        nickname  = author.get("nickname") or username
-        thumbnail = vdata.get("cover") or vdata.get("origin_cover") or ""
-        duration  = vdata.get("duration") or 0
+        # ── TikWM: untuk slideshow/foto atau ketika prenivapi gagal ──────────
+        vdata      = _fetch_tikwm_slideshow(url)
+        title      = vdata.get("title") or "TikTok Video"
+        author     = vdata.get("author") or {}
+        username   = author.get("unique_id") or "Unknown"
+        nickname   = author.get("nickname") or username
+        thumbnail  = vdata.get("cover") or vdata.get("origin_cover") or ""
+        duration   = vdata.get("duration") or 0
         play_count = vdata.get("play_count") or 0
-        images    = vdata.get("images") or []
-        is_photo  = len(images) > 0
+        images     = vdata.get("images") or []
+        is_photo   = len(images) > 0
 
         if not thumbnail and is_photo and images:
             thumbnail = images[0] if isinstance(images[0], str) else images[0].get("url", "")
@@ -396,7 +420,7 @@ def get_tiktok_info(url: str):
         if not video_formats:
             raise HTTPException(status_code=400, detail="Tidak ada URL download yang tersedia")
 
-        print(f"TikWM fallback OK: {title!r} is_photo={is_photo}")
+        print(f"TikWM OK: {title!r} is_photo={is_photo}")
         return {
             "title": title,
             "thumbnail": thumbnail,
@@ -747,7 +771,7 @@ def download_instagram(url: str, background_tasks: BackgroundTasks, format_id: O
     """Download Instagram media using SnapSave."""
     if not task_id:
         task_id = str(uuid.uuid4())
-    base_name = f"temp_ig_{task_id}"
+    base_name = os.path.join(backend_dir, f"temp_ig_{task_id}")
     download_progress[task_id] = {"status": "starting", "progress": 0.0}
 
     try:
@@ -839,7 +863,7 @@ def download_instagram_all(url: str, background_tasks: BackgroundTasks, task_id:
     """Download all photos/videos from an Instagram post as a ZIP file."""
     if not task_id:
         task_id = str(uuid.uuid4())
-    base_name = f"temp_ig_all_{task_id}"
+    base_name = os.path.join(backend_dir, f"temp_ig_all_{task_id}")
     zip_path  = f"{base_name}.zip"
     download_progress[task_id] = {"status": "starting", "progress": 0.0}
 
@@ -930,7 +954,7 @@ def download_tiktok(url: str, background_tasks: BackgroundTasks, format_id: Opti
 
     if not task_id:
         task_id = str(uuid.uuid4())
-    base_name = f"temp_{task_id}"
+    base_name = os.path.join(backend_dir, f"temp_{task_id}")
 
     # ── Dedup guard ──────────────────────────────────────────────────────────
     if task_id in download_progress:
@@ -1080,7 +1104,7 @@ def download_tiktok_all(url: str, background_tasks: BackgroundTasks, task_id: Op
     """Download all photos from a TikTok slideshow/photo post as a ZIP file."""
     if not task_id:
         task_id = str(uuid.uuid4())
-    base_name = f"temp_tk_all_{task_id}"
+    base_name = os.path.join(backend_dir, f"temp_tk_all_{task_id}")
     zip_path  = f"{base_name}.zip"
     download_progress[task_id] = {"status": "starting", "progress": 0.0}
 
@@ -1165,7 +1189,7 @@ def download_tiktok_mp3(url: str, background_tasks: BackgroundTasks, task_id: Op
     """Download TikTok sebagai MP3 — pakai audio URL dari prenivapi, fallback TikWM + ffmpeg."""
     if not task_id:
         task_id = str(uuid.uuid4())
-    base_name = f"temp_mp3_{task_id}"
+    base_name = os.path.join(backend_dir, f"temp_mp3_{task_id}")
     download_progress[task_id] = {"status": "starting", "progress": 0.0}
 
     def _dl(dl_url: str, dest: str, prog_start: float = 0.05, prog_end: float = 0.9):
@@ -1291,7 +1315,7 @@ def download_tiktok_mp3(url: str, background_tasks: BackgroundTasks, task_id: Op
 def download_video(url: str, format_id: str, background_tasks: BackgroundTasks, task_id: Optional[str] = None):
     if not task_id:
         task_id = str(uuid.uuid4())
-    base_name = f"temp_{task_id}"
+    base_name = os.path.join(backend_dir, f"temp_{task_id}")
 
     download_progress[task_id] = {"status": "starting", "progress": 0.0}
 
@@ -1386,7 +1410,7 @@ def download_video(url: str, format_id: str, background_tasks: BackgroundTasks, 
 def download_audio(url: str, background_tasks: BackgroundTasks, task_id: Optional[str] = None):
     if not task_id:
         task_id = str(uuid.uuid4())
-    base_name = f"temp_{task_id}"
+    base_name = os.path.join(backend_dir, f"temp_{task_id}")
     output_m4a = f"{base_name}.m4a"
 
     download_progress[task_id] = {"status": "starting", "progress": 0.0}
@@ -1585,7 +1609,7 @@ def download_spotify(url: str, background_tasks: BackgroundTasks, task_id: Optio
     """Download a Spotify track as MP3."""
     if not task_id:
         task_id = str(uuid.uuid4())
-    base_name = f"temp_spotify_{task_id}"
+    base_name = os.path.join(backend_dir, f"temp_spotify_{task_id}")
     dest_path = f"{base_name}.mp3"
 
     download_progress[task_id] = {"status": "starting", "progress": 0.0}
