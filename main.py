@@ -269,132 +269,134 @@ def get_info(url: str):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+def _fetch_prenivapi_tiktok(url: str) -> Dict[str, Any]:
+    """Call prenivapi to get TikTok video/audio data. Returns normalized dict."""
+    api_url = f"https://prenivapi.vercel.app/api/tiktok?url={requests.utils.quote(url, safe='')}"
+    resp = requests.get(
+        api_url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise Exception(f"prenivapi returned HTTP {resp.status_code}")
+    data = resp.json()
+    if not data.get("status") or not data.get("data"):
+        raise Exception("prenivapi returned unsuccessful response")
+    return data["data"]
+
+
+def _fetch_tikwm_slideshow(url: str) -> Dict[str, Any]:
+    """Fallback to TikWM for slideshow/photo posts. Returns normalized response."""
+    clean = url.split("?")[0]
+    resp = requests.post(
+        "https://www.tikwm.com/api/",
+        data={"url": clean, "hd": 1},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise Exception(f"TikWM returned HTTP {resp.status_code}")
+    raw = resp.json()
+    if raw.get("code") != 0:
+        raise Exception(f"TikWM: {raw.get('msg', 'unknown error')}")
+    return raw["data"]
+
+
 @app.get("/tiktok/info")
 def get_tiktok_info(url: str):
-    """Get TikTok video information using TikWM API"""
+    """Get TikTok video/slideshow info via prenivapi (video) or TikWM (slideshow fallback)."""
     try:
-        # Clean the URL
-        if '?' in url:
-            clean_url = url.split('?')[0]
-        else:
-            clean_url = url
-            
-        print(f"Fetching TikTok info via TikWM API: {clean_url}")
-        
-        # Call TikWM API
-        api_url = "https://www.tikwm.com/api/"
-        params = {
-            "url": clean_url,
-            "hd": 1  # Request HD quality
-        }
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        response = requests.post(api_url, data=params, headers=headers, timeout=15)
-        
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=400,
-                detail=f"TikWM API error: status code {response.status_code}"
-            )
-        
-        data = response.json()
-        print(f"TikWM API response: {data.get('code')}, msg: {data.get('msg')}")
-        
-        # Check if request was successful
-        if data.get('code') != 0:
-            error_msg = data.get('msg', 'Unknown error')
-            raise HTTPException(
-                status_code=400,
-                detail=f"TikWM API error: {error_msg}"
-            )
-        
-        # Extract video info
-        video_data = data.get('data', {})
-        
-        title = video_data.get('title', 'TikTok Video')
-        author = video_data.get('author', {})
-        username = author.get('unique_id', 'Unknown')
-        nickname = author.get('nickname', username)
-        
-        # Get video URLs
-        play_url = video_data.get('play', '')  # Standard quality
-        hdplay_url = video_data.get('hdplay', '')  # HD quality
-        wmplay_url = video_data.get('wmplay', '')  # With watermark
-        
-        # Check if it's a photo/slideshow
-        images = video_data.get('images', [])
-        is_photo = len(images) > 0
-        
-        # Get thumbnail — try cover, origin_cover, then first image for photo posts
-        thumbnail = video_data.get('cover', '') or video_data.get('origin_cover', '')
+        print(f"Fetching TikTok info: {url}")
+
+        # ── Try prenivapi first (video posts) ────────────────────────────────
+        try:
+            d = _fetch_prenivapi_tiktok(url)
+            downloads = d.get("downloads") or {}
+            video_list = downloads.get("video") or []
+            audio_list = downloads.get("audio") or []
+
+            title     = d.get("title") or "TikTok Video"
+            thumbnail = d.get("thumbnail") or ""
+            author    = d.get("author") or ""
+            channel   = f"@{author}" if author else "TikTok"
+            duration  = 0
+            metadata  = d.get("metadata") or {}
+
+            video_formats = []
+            if video_list:
+                # prenivapi returns one video URL (no HD/SD distinction visible)
+                video_formats.append({
+                    "resolution": "HD Quality",
+                    "format_id": "hd",
+                    "ext": "mp4",
+                    "download_url": video_list[0]["url"],
+                })
+                # If more than one entry, add second as SD
+                if len(video_list) > 1:
+                    video_formats.append({
+                        "resolution": "Standard Quality",
+                        "format_id": "sd",
+                        "ext": "mp4",
+                        "download_url": video_list[1]["url"],
+                    })
+
+            if not video_formats:
+                raise Exception("No video URLs in prenivapi response")
+
+            print(f"prenivapi OK: {title!r} — {len(video_formats)} video format(s)")
+            return {
+                "title": title,
+                "thumbnail": thumbnail,
+                "channel": channel,
+                "duration": duration,
+                "description": title,
+                "video_formats": video_formats,
+                "platform": "tiktok",
+                "play_count": 0,
+                "is_photo": False,
+                # Store audio URL for MP3 downloads
+                "_audio_url": audio_list[0]["url"] if audio_list else "",
+            }
+
+        except Exception as preniv_err:
+            print(f"prenivapi failed ({preniv_err}), trying TikWM for slideshow fallback...")
+
+        # ── Fallback: TikWM (handles slideshows + videos) ─────────────────────
+        vdata     = _fetch_tikwm_slideshow(url)
+        title     = vdata.get("title") or "TikTok Video"
+        author    = vdata.get("author") or {}
+        username  = author.get("unique_id") or "Unknown"
+        nickname  = author.get("nickname") or username
+        thumbnail = vdata.get("cover") or vdata.get("origin_cover") or ""
+        duration  = vdata.get("duration") or 0
+        play_count = vdata.get("play_count") or 0
+        images    = vdata.get("images") or []
+        is_photo  = len(images) > 0
+
         if not thumbnail and is_photo and images:
-            # For photo/slideshow, use the first image as thumbnail
-            thumbnail = images[0] if isinstance(images[0], str) else images[0].get('url', '')
-        
-        # Fallback: fetch thumbnail via yt-dlp if still empty
-        if not thumbnail:
-            try:
-                ydl_opts_thumb = {'quiet': True, 'no_warnings': True}
-                with yt_dlp.YoutubeDL(ydl_opts_thumb) as ydl:
-                    meta = ydl.extract_info(url, download=False)
-                    if meta:
-                        thumbnail = meta.get('thumbnail', '')
-                        if not thumbnail:
-                            thumbs = meta.get('thumbnails') or []
-                            if thumbs:
-                                thumbnail = thumbs[-1].get('url', '')
-                print(f"yt-dlp thumbnail fallback: {thumbnail[:60] if thumbnail else 'none'}")
-            except Exception as e:
-                print(f"yt-dlp thumbnail fallback failed: {e}")
-        
-        # Get duration
-        duration = video_data.get('duration', 0)
-        
-        # Get video stats
-        play_count = video_data.get('play_count', 0)
-        
-        print(f"Berhasil fetch TikTok via TikWM: {title} by @{username}, is_photo: {is_photo}")
-        
-        # Build formats list
+            thumbnail = images[0] if isinstance(images[0], str) else images[0].get("url", "")
+
         video_formats = []
-        
         if is_photo:
-            # For photo/slideshow, return image URLs
             for idx, img_url in enumerate(images):
                 video_formats.append({
                     "resolution": f"Image {idx + 1}",
                     "format_id": f"img_{idx}",
                     "ext": "jpg",
-                    "download_url": img_url
+                    "download_url": img_url,
                 })
         else:
-            # Untuk video: play dan hdplay sudah termasuk audio asli
-            # Prioritaskan hdplay terlebih dahulu jika tersedia
-            if hdplay_url:
-                video_formats.append({
-                    "resolution": "HD Quality",
-                    "format_id": "hd",
-                    "ext": "mp4",
-                    "download_url": hdplay_url
-                })
-            
-            if play_url and play_url != hdplay_url:
-                video_formats.append({
-                    "resolution": "Standard Quality",
-                    "format_id": "sd",
-                    "ext": "mp4",
-                    "download_url": play_url
-                })
-        
+            hdplay = vdata.get("hdplay") or ""
+            play   = vdata.get("play")   or ""
+            if hdplay:
+                video_formats.append({"resolution": "HD Quality",       "format_id": "hd", "ext": "mp4", "download_url": hdplay})
+            if play and play != hdplay:
+                video_formats.append({"resolution": "Standard Quality", "format_id": "sd", "ext": "mp4", "download_url": play})
+
         if not video_formats:
-            raise HTTPException(
-                status_code=400,
-                detail="Tidak ada URL download yang tersedia dari TikWM API"
-            )
-        
+            raise HTTPException(status_code=400, detail="Tidak ada URL download yang tersedia")
+
+        print(f"TikWM fallback OK: {title!r} is_photo={is_photo}")
         return {
             "title": title,
             "thumbnail": thumbnail,
@@ -404,22 +406,15 @@ def get_tiktok_info(url: str):
             "video_formats": video_formats,
             "platform": "tiktok",
             "play_count": play_count,
-            "is_photo": is_photo
+            "is_photo": is_photo,
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
         import traceback
-        error_msg = str(e)
-        full_traceback = traceback.format_exc()
-        print(f"Error TikTok via TikWM: {error_msg}")
-        print(f"Full traceback:\n{full_traceback}")
-        
-        raise HTTPException(
-            status_code=400,
-            detail=f"Error mengambil info TikTok: {error_msg}"
-        )
+        print(f"TikTok info error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=f"Error mengambil info TikTok: {e}")
 
 
 # --- Instagram ---
@@ -929,37 +924,28 @@ def download_instagram_all(url: str, background_tasks: BackgroundTasks, task_id:
 
 @app.get("/tiktok/download")
 def download_tiktok(url: str, background_tasks: BackgroundTasks, format_id: Optional[str] = "hd", task_id: Optional[str] = None):
-    """Download TikTok video or photo using TikWM API, merge audio if needed."""
-    # Jika format_id=mp3, redirect ke endpoint download_tiktok_mp3
+    """Download TikTok video/photo via prenivapi (video) or TikWM (slideshow)."""
     if format_id == "mp3":
         return download_tiktok_mp3(url, background_tasks, task_id)
-    
+
     if not task_id:
         task_id = str(uuid.uuid4())
     base_name = f"temp_{task_id}"
 
-    # ── Dedup: kalau task_id ini sudah selesai, langsung return file yang ada ──
+    # ── Dedup guard ──────────────────────────────────────────────────────────
     if task_id in download_progress:
         existing = download_progress[task_id]
-        # Kalau sudah completed dan file masih ada, serve ulang
         if existing.get("status") == "completed":
             final_path = existing.get("final_path", "")
             if final_path and os.path.isfile(final_path):
                 from urllib.parse import quote
                 fname = os.path.basename(final_path)
                 ascii_name = fname.encode('ascii', errors='replace').decode('ascii').replace('?', '_')
-                utf8_name  = quote(fname, safe='')
-                return FileResponse(
-                    final_path,
-                    media_type="video/mp4",
-                    headers={"Content-Disposition": f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{utf8_name}'},
-                )
+                return FileResponse(final_path, media_type="video/mp4",
+                    headers={"Content-Disposition": f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(fname, safe="")}'})
 
-    # ── Cegah request duplikat yang sedang berjalan ───────────────────────────
     if task_id in _active_tasks:
-        # Return progress saja, download sedang berjalan di request lain
         import time
-        # Poll sampai selesai (max 15 menit)
         for _ in range(900):
             prog = download_progress.get(task_id, {})
             if prog.get("status") == "completed":
@@ -968,12 +954,8 @@ def download_tiktok(url: str, background_tasks: BackgroundTasks, format_id: Opti
                     from urllib.parse import quote
                     fname = os.path.basename(final_path)
                     ascii_name = fname.encode('ascii', errors='replace').decode('ascii').replace('?', '_')
-                    utf8_name  = quote(fname, safe='')
-                    return FileResponse(
-                        final_path,
-                        media_type="video/mp4",
-                        headers={"Content-Disposition": f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{utf8_name}'},
-                    )
+                    return FileResponse(final_path, media_type="video/mp4",
+                        headers={"Content-Disposition": f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(fname, safe="")}'})
             if prog.get("status") == "error":
                 raise HTTPException(status_code=400, detail=prog.get("error", "Download gagal"))
             time.sleep(1)
@@ -982,15 +964,14 @@ def download_tiktok(url: str, background_tasks: BackgroundTasks, format_id: Opti
     _active_tasks.add(task_id)
     download_progress[task_id] = {"status": "starting", "progress": 0.0}
 
-    def _dl(dl_url: str, dest: str, prog_start: float = 0.1, prog_end: float = 0.9):
-        """Download URL ke file, update progress."""
+    def _dl(dl_url: str, dest: str, prog_start: float = 0.05, prog_end: float = 1.0):
         hdrs = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Referer': 'https://www.tiktok.com/',
             'Accept': '*/*',
             'Accept-Encoding': 'identity',
         }
-        r = requests.get(dl_url, headers=hdrs, stream=True, timeout=60, allow_redirects=True)
+        r = requests.get(dl_url, headers=hdrs, stream=True, timeout=120, allow_redirects=True)
         if r.status_code not in (200, 206):
             raise Exception(f"HTTP {r.status_code} saat download")
         total = int(r.headers.get('content-length', 0))
@@ -1002,91 +983,72 @@ def download_tiktok(url: str, background_tasks: BackgroundTasks, format_id: Opti
                     got += len(chunk)
                     if total > 0:
                         pct = prog_start + (got / total) * (prog_end - prog_start)
-                        download_progress[task_id] = {
-                            "status": "downloading",
-                            "progress": pct,
-                            "total": f"{total / 1048576:.1f}MB",
-                        }
+                        download_progress[task_id] = {"status": "downloading", "progress": pct,
+                                                       "total": f"{total/1048576:.1f}MB"}
         if got < 10240:
-            raise Exception(f"File terlalu kecil ({got} bytes), URL mungkin expired.")
+            raise Exception(f"File terlalu kecil ({got} bytes)")
         return got
 
     try:
-        clean_url = url.split('?')[0] if '?' in url else url
-        print(f"Downloading TikTok: {clean_url}")
+        import time
 
-        # ── Panggil TikWM langsung untuk dapat music_url juga ─────────────
-        api_resp = requests.post(
-            "https://www.tikwm.com/api/",
-            data={"url": clean_url, "hd": 1},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15,
-        )
-        raw = api_resp.json()
-        if raw.get('code') != 0:
-            raise Exception(f"TikWM: {raw.get('msg', 'unknown error')}")
-
-        vdata       = raw['data']
-        is_photo    = bool(vdata.get('images'))
-        play_url    = vdata.get('play', '')
-        hdplay_url  = vdata.get('hdplay', '')
-        music_url   = vdata.get('music', '')   # audio terpisah
-        hd_size     = vdata.get('hd_size', 0)
-        sd_size     = vdata.get('size', 0)
-        title       = vdata.get('title', 'tiktok')
-
-        # ── Foto / slideshow ──────────────────────────────────────────────
-        if is_photo:
-            images = vdata.get('images', [])
-            # format_id: "img_0", "img_1", ...
+        # ── Slideshow check: format_id starts with img_ → use TikWM ────────
+        if format_id and format_id.startswith("img_"):
+            vdata = _fetch_tikwm_slideshow(url)
+            images = vdata.get("images") or []
             idx = 0
             try:
-                idx = int(format_id.replace('img_', ''))
+                idx = int(format_id.replace("img_", ""))
             except Exception:
                 pass
-            img_url = images[idx] if idx < len(images) else images[0]
+            img_url  = images[idx] if idx < len(images) else images[0]
             img_path = f"{base_name}_img{idx}.jpg"
-            _dl(img_url, img_path)
+            _dl(img_url, img_path, 0.1, 0.9)
             download_progress[task_id] = {"status": "completed", "progress": 1.0}
-
-            import time
-            safe = f"tiktok_{int(time.time())}_img{idx + 1}"
-
+            safe = f"tiktok_{int(time.time())}_img{idx+1}"
             def cleanup_all():
-                cleanup_files(base_name)
-                download_progress.pop(task_id, None)
+                cleanup_files(base_name); download_progress.pop(task_id, None)
             background_tasks.add_task(cleanup_all)
-
             from urllib.parse import quote
             utf8 = quote(f"{safe}.jpg", safe='')
-            return FileResponse(
-                img_path, media_type="image/jpeg",
-                headers={"Content-Disposition": f'attachment; filename="{safe}.jpg"; filename*=UTF-8\'\'{utf8}'},
-            )
+            return FileResponse(img_path, media_type="image/jpeg",
+                headers={"Content-Disposition": f'attachment; filename="{safe}.jpg"; filename*=UTF-8\'\'{utf8}'})
 
-        # ── Video ─────────────────────────────────────────────────────────
-        # Pilih video URL
-        if format_id == 'sd' and play_url:
-            video_url = play_url
-        else:
-            video_url = hdplay_url or play_url
+        # ── Video: try prenivapi first ────────────────────────────────────
+        title     = "tiktok"
+        video_url = ""
+
+        try:
+            d         = _fetch_prenivapi_tiktok(url)
+            title     = d.get("title") or "tiktok"
+            downloads = d.get("downloads") or {}
+            video_list = downloads.get("video") or []
+            if not video_list:
+                raise Exception("No video URL in prenivapi response")
+            # format_id "hd" → first entry, "sd" → second if available
+            if format_id == "sd" and len(video_list) > 1:
+                video_url = video_list[1]["url"]
+            else:
+                video_url = video_list[0]["url"]
+            print(f"prenivapi video URL obtained for: {title!r}")
+        except Exception as preniv_err:
+            print(f"prenivapi failed for download ({preniv_err}), falling back to TikWM")
+            vdata     = _fetch_tikwm_slideshow(url)
+            title     = vdata.get("title") or "tiktok"
+            hdplay    = vdata.get("hdplay") or ""
+            play      = vdata.get("play")   or ""
+            video_url = play if (format_id == "sd" and play) else (hdplay or play)
 
         if not video_url:
             raise Exception("Tidak ada URL video tersedia")
 
         video_path = f"{base_name}_video.mp4"
         download_progress[task_id] = {"status": "downloading", "progress": 0.05}
-
-        # Download video asli (sudah termasuk audio asli)
-        _dl(video_url, video_path, prog_start=0.05, prog_end=1.0)
-
-        # Pakai video langsung tanpa merge apapun
-        final_path = video_path
+        _dl(video_url, video_path, 0.05, 1.0)
 
         download_progress[task_id] = {"status": "completed", "progress": 1.0}
-
-        import time
         safe_title = re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:60] or f"tiktok_{int(time.time())}"
+        download_progress[task_id]["final_path"] = video_path
 
         def cleanup_all():
             cleanup_files(base_name)
@@ -1097,15 +1059,8 @@ def download_tiktok(url: str, background_tasks: BackgroundTasks, format_id: Opti
         from urllib.parse import quote
         ascii_name = safe_title.encode('ascii', errors='replace').decode('ascii').replace('?', '_')
         utf8_name  = quote(f"{safe_title}.mp4", safe='')
-
-        # Simpan final_path supaya request duplikat bisa serve ulang
-        download_progress[task_id]["final_path"] = final_path
-
-        return FileResponse(
-            final_path,
-            media_type="video/mp4",
-            headers={"Content-Disposition": f'attachment; filename="{ascii_name}.mp4"; filename*=UTF-8\'\'{utf8_name}'},
-        )
+        return FileResponse(video_path, media_type="video/mp4",
+            headers={"Content-Disposition": f'attachment; filename="{ascii_name}.mp4"; filename*=UTF-8\'\'{utf8_name}'})
 
     except HTTPException:
         cleanup_files(base_name)
@@ -1207,21 +1162,20 @@ def download_tiktok_all(url: str, background_tasks: BackgroundTasks, task_id: Op
 
 @app.get("/tiktok/download/mp3")
 def download_tiktok_mp3(url: str, background_tasks: BackgroundTasks, task_id: Optional[str] = None):
-    """Download TikTok sebagai MP3 audio."""
+    """Download TikTok sebagai MP3 — pakai audio URL dari prenivapi, fallback TikWM + ffmpeg."""
     if not task_id:
         task_id = str(uuid.uuid4())
     base_name = f"temp_mp3_{task_id}"
     download_progress[task_id] = {"status": "starting", "progress": 0.0}
-    
-    def _dl(dl_url: str, dest: str, prog_start: float = 0.1, prog_end: float = 0.7):
-        """Download URL ke file, update progress."""
+
+    def _dl(dl_url: str, dest: str, prog_start: float = 0.05, prog_end: float = 0.9):
         hdrs = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Referer': 'https://www.tiktok.com/',
             'Accept': '*/*',
             'Accept-Encoding': 'identity',
         }
-        r = requests.get(dl_url, headers=hdrs, stream=True, timeout=60, allow_redirects=True)
+        r = requests.get(dl_url, headers=hdrs, stream=True, timeout=120, allow_redirects=True)
         if r.status_code not in (200, 206):
             raise Exception(f"HTTP {r.status_code} saat download")
         total = int(r.headers.get('content-length', 0))
@@ -1233,90 +1187,83 @@ def download_tiktok_mp3(url: str, background_tasks: BackgroundTasks, task_id: Op
                     got += len(chunk)
                     if total > 0:
                         pct = prog_start + (got / total) * (prog_end - prog_start)
-                        download_progress[task_id] = {
-                            "status": "downloading",
-                            "progress": pct,
-                            "total": f"{total / 1048576:.1f}MB",
-                        }
+                        download_progress[task_id] = {"status": "downloading", "progress": pct,
+                                                       "total": f"{total/1048576:.1f}MB"}
         if got < 1024:
-            raise Exception(f"File terlalu kecil ({got} bytes), URL mungkin expired.")
+            raise Exception(f"File terlalu kecil ({got} bytes)")
         return got
 
     try:
-        clean_url = url.split('?')[0] if '?' in url else url
-        print(f"Downloading TikTok MP3: {clean_url}")
+        import time
+        print(f"Downloading TikTok MP3: {url}")
 
-        # Panggil TikWM API
-        api_resp = requests.post(
-            "https://www.tikwm.com/api/",
-            data={"url": clean_url, "hd": 1},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15,
-        )
-        raw = api_resp.json()
-        if raw.get('code') != 0:
-            raise Exception(f"TikWM: {raw.get('msg', 'unknown error')}")
+        title     = "tiktok"
+        audio_url = ""
+        mp3_path  = f"{base_name}.mp3"
 
-        vdata = raw['data']
-        title = vdata.get('title', 'tiktok')
-        
-        # Prioritaskan: download video lalu extract audio (untuk audio asli)
-        # Fallback: gunakan music_url jika tersedia
-        play_url = vdata.get('play', '')
-        hdplay_url = vdata.get('hdplay', '')
-        music_url = vdata.get('music', '')
-        
-        video_url = hdplay_url or play_url
-        
-        if not video_url and not music_url:
-            raise Exception("Tidak ada media yang bisa di-download")
+        # ── Try prenivapi — gives a direct audio URL ──────────────────────
+        try:
+            d          = _fetch_prenivapi_tiktok(url)
+            title      = d.get("title") or "tiktok"
+            audio_list = (d.get("downloads") or {}).get("audio") or []
+            if audio_list:
+                audio_url = audio_list[0]["url"]
+                print(f"prenivapi audio URL obtained for: {title!r}")
+            else:
+                raise Exception("No audio URL in prenivapi response")
+        except Exception as preniv_err:
+            print(f"prenivapi audio failed ({preniv_err}), falling back to TikWM + ffmpeg")
 
-        # Download video (atau audio)
-        if video_url:
-            video_path = f"{base_name}_video.mp4"
+        if audio_url:
+            # Direct audio download — no ffmpeg needed
+            audio_path = f"{base_name}_audio"
             download_progress[task_id] = {"status": "downloading", "progress": 0.05}
-            _dl(video_url, video_path, prog_start=0.05, prog_end=0.65)
-            
-            # Extract audio menjadi MP3
-            mp3_path = f"{base_name}.mp3"
-            download_progress[task_id] = {"status": "processing", "progress": 0.70}
-            
+            _dl(audio_url, audio_path, 0.05, 0.9)
+
+            # Convert to proper MP3 with ffmpeg (normalise format)
+            download_progress[task_id] = {"status": "processing", "progress": 0.9}
             ffmpeg_cmd = [
-                'ffmpeg', '-y',
-                '-i', video_path,
-                '-vn',  # tanpa video
-                '-acodec', 'libmp3lame',
-                '-ab', '320k',  # bitrate tinggi
-                '-ar', '44100',
-                mp3_path
+                'ffmpeg', '-y', '-i', audio_path,
+                '-acodec', 'libmp3lame', '-ab', '320k', '-ar', '44100',
+                mp3_path,
             ]
             result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=120)
             if result.returncode != 0 or not os.path.isfile(mp3_path) or os.path.getsize(mp3_path) < 1024:
-                raise Exception(f"Gagal extract audio: {result.stderr}")
+                # ffmpeg failed — just rename the raw audio as mp3
+                os.rename(audio_path, mp3_path)
         else:
-            # Fallback: download music_url langsung
-            audio_path = f"{base_name}_audio"
-            download_progress[task_id] = {"status": "downloading", "progress": 0.05}
-            _dl(music_url, audio_path, prog_start=0.05, prog_end=0.90)
-            
-            # Convert ke MP3 jika bukan MP3
-            mp3_path = f"{base_name}.mp3"
-            download_progress[task_id] = {"status": "processing", "progress": 0.92}
-            
-            ffmpeg_cmd = [
-                'ffmpeg', '-y',
-                '-i', audio_path,
-                '-acodec', 'libmp3lame',
-                '-ab', '320k',
-                mp3_path
-            ]
-            subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=120)
-            if not os.path.isfile(mp3_path) or os.path.getsize(mp3_path) < 1024:
-                mp3_path = audio_path
+            # ── Fallback: TikWM → download video → extract audio with ffmpeg ──
+            vdata     = _fetch_tikwm_slideshow(url)
+            title     = vdata.get("title") or "tiktok"
+            video_url = vdata.get("hdplay") or vdata.get("play") or ""
+            music_url = vdata.get("music") or ""
+
+            if not video_url and not music_url:
+                raise Exception("Tidak ada media yang bisa di-download")
+
+            if video_url:
+                video_path = f"{base_name}_video.mp4"
+                download_progress[task_id] = {"status": "downloading", "progress": 0.05}
+                _dl(video_url, video_path, 0.05, 0.65)
+                download_progress[task_id] = {"status": "processing", "progress": 0.70}
+                ffmpeg_cmd = [
+                    'ffmpeg', '-y', '-i', video_path,
+                    '-vn', '-acodec', 'libmp3lame', '-ab', '320k', '-ar', '44100',
+                    mp3_path,
+                ]
+                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=120)
+                if result.returncode != 0 or not os.path.isfile(mp3_path) or os.path.getsize(mp3_path) < 1024:
+                    raise Exception(f"ffmpeg extract audio gagal: {result.stderr[:200]}")
+            else:
+                raw_audio = f"{base_name}_raw_audio"
+                _dl(music_url, raw_audio, 0.05, 0.90)
+                download_progress[task_id] = {"status": "processing", "progress": 0.92}
+                subprocess.run(['ffmpeg', '-y', '-i', raw_audio, '-acodec', 'libmp3lame', '-ab', '320k', mp3_path],
+                               capture_output=True, text=True, timeout=120)
+                if not os.path.isfile(mp3_path) or os.path.getsize(mp3_path) < 1024:
+                    os.rename(raw_audio, mp3_path)
 
         download_progress[task_id] = {"status": "completed", "progress": 1.0}
-
-        import time
         safe_title = re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:60] or f"tiktok_{int(time.time())}"
 
         def cleanup_all():
@@ -1327,12 +1274,8 @@ def download_tiktok_mp3(url: str, background_tasks: BackgroundTasks, task_id: Op
         from urllib.parse import quote
         ascii_name = safe_title.encode('ascii', errors='replace').decode('ascii').replace('?', '_')
         utf8_name  = quote(f"{safe_title}.mp3", safe='')
-
-        return FileResponse(
-            mp3_path,
-            media_type="audio/mpeg",
-            headers={"Content-Disposition": f'attachment; filename="{ascii_name}.mp3"; filename*=UTF-8\'\'{utf8_name}'},
-        )
+        return FileResponse(mp3_path, media_type="audio/mpeg",
+            headers={"Content-Disposition": f'attachment; filename="{ascii_name}.mp3"; filename*=UTF-8\'\'{utf8_name}'})
 
     except HTTPException:
         cleanup_files(base_name)
